@@ -44,7 +44,7 @@ export class WaitlistManager {
       
       -- Simple incrementing score with large gaps
       local count = redis.call('ZCARD', KEYS[1])
-      local score = (count + 1) * 1000000
+      local score = (count + 1) * 10000000
       
       redis.call('ZADD', KEYS[1], score, id)
       if email ~= '' then
@@ -143,41 +143,53 @@ export class WaitlistManager {
   async bumpUserUp(id: string, targetPosition: number): Promise<boolean> {
     const script = `
       local id, targetPos = ARGV[1], tonumber(ARGV[2])
+      local SCORE_GAP = 10000000
+      local lockKey = KEYS[1] .. ':lock'
       
-      -- Get current position and all members
-      local currentRank = redis.call('ZRANK', KEYS[1], id)
-      if not currentRank then return 0 end
-      
-      -- Get all members and their scores
-      local members = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
-      local scores = {}
-      for i = 2, #members, 2 do
-        scores[#scores + 1] = tonumber(members[i])
+      if redis.call('SET', lockKey, '1', 'NX', 'PX', 1000) == false then
+        return 0
       end
-      
-      -- Calculate new score for insertion
+
+      local currentRank = redis.call('ZRANK', KEYS[1], id)
+      if not currentRank then 
+        redis.call('DEL', lockKey)
+        return 0 
+      end
+
+      -- Get target scores based on direction
+      local scores
+      if targetPos == 1 then
+        scores = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+      elseif currentRank + 1 < targetPos then
+        -- Moving backwards (down the list): get target-1 and target
+        scores = redis.call('ZRANGE', KEYS[1], targetPos - 1, targetPos, 'WITHSCORES')
+      else
+        -- Moving forwards (up the list): get target-2 and target-1
+        scores = redis.call('ZRANGE', KEYS[1], targetPos - 2, targetPos - 1, 'WITHSCORES')
+      end
+
       local newScore
       if targetPos == 1 then
-        -- Moving to front
-        newScore = scores[1] - 1000000
+        newScore = tonumber(scores[2]) - SCORE_GAP
       else
-        -- Get scores around target position
-        local beforeScore = scores[targetPos - 1]
-        local atScore = scores[targetPos]
-        -- Place between them
+        local beforeScore = tonumber(scores[2])
+        local atScore = tonumber(scores[4])
         newScore = beforeScore + ((atScore - beforeScore) / 2)
       end
       
       redis.call('ZADD', KEYS[1], newScore, id)
+      redis.call('DEL', lockKey)
       return 1
     `;
 
-    return await this.redis.eval(script, 1, this.keys.waitlist, id, targetPosition) === 1;
-  }
- 
-  async getPosition(id: string): Promise<number> {
-    const rank = await this.redis.zrank(this.keys.waitlist, id);
-    return rank === null ? 0 : rank + 1;
+    let attempts = 3;
+    while (attempts > 0) {
+      const result = await this.redis.eval(script, 1, this.keys.waitlist, id, targetPosition);
+      if (result === 1) return true;
+      attempts--;
+      if (attempts > 0) await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return false;
   }
  
   async deleteUser(id: string): Promise<boolean> {
@@ -193,9 +205,94 @@ export class WaitlistManager {
       .exec();
     return true;
   }
+
+  async deleteUserByEmail(email: string): Promise<boolean> {
+    const script = `
+      local email = ARGV[1]
+      
+      -- Get user ID from email
+      local userId = redis.call('HGET', KEYS[3], email)
+      if not userId then return 0 end
+      
+      -- Get full user data
+      local userData = redis.call('HGET', KEYS[2], userId)
+      if not userData then return 0 end
+      
+      -- Parse user data to get phone
+      local data = cjson.decode(userData)
+      local phone = data.phone or ''
+      
+      -- Remove from all data structures
+      redis.call('ZREM', KEYS[1], userId)
+      redis.call('HDEL', KEYS[2], userId)
+      redis.call('HDEL', KEYS[3], email)
+      if phone ~= '' then
+        redis.call('HDEL', KEYS[4], phone)
+      end
+      
+      return 1
+    `;
+
+    const result = await this.redis.eval(
+      script,
+      4,
+      this.keys.waitlist,
+      this.keys.users,
+      this.keys.emails,
+      this.keys.phones,
+      email
+    ) as number;
+
+    return result === 1;
+  }
+
+  async deleteUserByPhone(phone: string): Promise<boolean> {
+    const script = `
+      local phone = ARGV[1]
+      
+      -- Get user ID from phone
+      local userId = redis.call('HGET', KEYS[4], phone)
+      if not userId then return 0 end
+      
+      -- Get full user data
+      local userData = redis.call('HGET', KEYS[2], userId)
+      if not userData then return 0 end
+      
+      -- Parse user data to get email
+      local data = cjson.decode(userData)
+      local email = data.email or ''
+      
+      -- Remove from all data structures
+      redis.call('ZREM', KEYS[1], userId)
+      redis.call('HDEL', KEYS[2], userId)
+      if email ~= '' then
+        redis.call('HDEL', KEYS[3], email)
+      end
+      redis.call('HDEL', KEYS[4], phone)
+      
+      return 1
+    `;
+
+    const result = await this.redis.eval(
+      script,
+      4,
+      this.keys.waitlist,
+      this.keys.users,
+      this.keys.emails,
+      this.keys.phones,
+      phone
+    ) as number;
+
+    return result === 1;
+  }
  
   async disconnect(): Promise<void> {
     await this.redis.quit();
+  }
+
+  async getPosition(id: string): Promise<number> {
+    const rank = await this.redis.zrank(this.keys.waitlist, id);
+    return rank === null ? 0 : rank + 1;
   }
  
   async _getOrderedIds(): Promise<string[]> {
