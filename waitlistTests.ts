@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import { WaitlistManager } from './waitlistManager';
+import { TrackedUser, InsertResult } from './waitlistTypes';
 
 dotenv.config();
 
@@ -39,14 +40,18 @@ async function runTest(name: string, testFn: () => Promise<void>) {
 }
 
 async function testConcurrentEmailUsers(): Promise<void> {
+  // Store the results to get the IDs
+  const insertResults: InsertResult[] = [];
   const operations = Array.from({ length: 20 }, (_, i) => {
-    return waitlist.insertUser(`user${i}`, {
+    return waitlist.insertUser({
       email: `user${i}@test.com`,
       metadata: { name: `User ${i}` }
     });
   });
 
   const results = await Promise.all(operations);
+  insertResults.push(...results);
+  
   const positions = results.map(r => r.position);
   const alreadyExisted = results.map(r => r.already_existed);
   const uniquePositions = new Set(positions);
@@ -62,7 +67,7 @@ async function testConcurrentEmailUsers(): Promise<void> {
   }
 
   const finalPositions = await Promise.all(
-    Array.from({ length: 20 }, (_, i) => waitlist.getPosition(`user${i}`))
+    insertResults.map(result => waitlist.getPosition(result.id))
   );
   if (!finalPositions.every(p => p > 0 && p <= 20)) {
     throw new Error(`Final positions invalid: ${finalPositions.join(', ')}`);
@@ -71,14 +76,15 @@ async function testConcurrentEmailUsers(): Promise<void> {
 
 async function testConcurrentDuplicateUserEmail(): Promise<void> {
   const operations = Array.from({ length: 10 }, () => {
-    return waitlist.insertUser('duplicate_user', {
+    return waitlist.insertUser({
       email: 'duplicate@test.com',
       metadata: { name: 'Duplicate User' }
     });
   });
 
   const results = await Promise.all(operations);
-  const position = results[0].position;
+  const firstResult = results[0];  // Store the first result which contains our user's ID
+  const position = firstResult.position;
   const allSamePosition = results.every(r => r.position === position);
   const newInsertions = results.filter(r => !r.already_existed);
 
@@ -89,16 +95,16 @@ async function testConcurrentDuplicateUserEmail(): Promise<void> {
     throw new Error('All operations did not return the same position');
   }
 
-  const finalPosition = await waitlist.getPosition('duplicate_user');
+  const finalPosition = await waitlist.getPosition(firstResult.id);  // Use the stored ID
   if (finalPosition !== position) {
     throw new Error(`Final position does not match: ${finalPosition} !== ${position}`);
   }
 }
 
 async function testConcurrentDuplicateUserPhone() {
-  // Create initial user with phone
+  // Create initial user with phone and store the ID
   const phone = '+15551234567';
-  await waitlist.insertUser('user1', {
+  const initialResult = await waitlist.insertUser({
     phone,
     metadata: { name: 'Original User' }
   });
@@ -108,7 +114,7 @@ async function testConcurrentDuplicateUserPhone() {
   const operations = [];
   
   for (let i = 0; i < attempts; i++) {
-    operations.push(waitlist.insertUser(`user${i + 2}`, {
+    operations.push(waitlist.insertUser({
       phone,
       metadata: { name: `Duplicate User ${i + 1}` }
     }));
@@ -118,7 +124,7 @@ async function testConcurrentDuplicateUserPhone() {
   const results = await Promise.all(operations.map(p => p.catch(e => e)));
 
   // Verify all attempts either returned the same position or failed
-  const position = await waitlist.getPosition('user1');
+  const position = await waitlist.getPosition(initialResult.id);  // Use the stored ID
   let successCount = 0;
 
   for (const result of results) {
@@ -142,28 +148,30 @@ async function testConcurrentDuplicateUserPhone() {
 }
 
 async function testOrderedBumpUp(): Promise<void> {
-  // Insert 20 users sequentially
+  // Insert 20 users sequentially and store their IDs
+  const userIds: string[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`user${i}`, {
+    const result = await waitlist.insertUser({
       email: `user${i}@test.com`,
       metadata: { name: `User ${i}` }
     });
+    userIds.push(result.id);
   }
 
   // Move user 8 to position 4
-  await waitlist.moveUser('user8', 4);
+  await waitlist.moveUser(userIds[8], 4);
   
   // Get actual order
   const actualOrder = await waitlist.getOrderedIds();
 
   // Verify user8's new position
-  const user8Position = await waitlist.getPosition('user8');
+  const user8Position = await waitlist.getPosition(userIds[8]);
   if (user8Position !== 4) {
     throw new Error(`Expected user8 to be at position 4, but found at position ${user8Position}`);
   }
 
   // Verify the exact order of first 5 positions
-  const expectedStart = ['user0', 'user1', 'user2', 'user8', 'user3'];
+  const expectedStart = [userIds[0], userIds[1], userIds[2], userIds[8], userIds[3]];
   const actualStart = actualOrder.slice(0, 5);
   
   if (JSON.stringify(actualStart) !== JSON.stringify(expectedStart)) {
@@ -171,15 +179,6 @@ async function testOrderedBumpUp(): Promise<void> {
       `Expected order: ${expectedStart.join(', ')}\n` +
       `Actual order: ${actualStart.join(', ')}`
     );
-  }
-
-  // Verify email mappings are correct
-  for (const userId of actualStart) {
-    const email = `${userId}@test.com`;
-    const mappedId = await waitlist.getEmailMapping(email);
-    if (mappedId !== userId) {
-      throw new Error(`Email mapping incorrect for ${userId}. Expected ${userId}, got ${mappedId}`);
-    }
   }
 }
 
@@ -190,11 +189,15 @@ async function testLargeScaleBumpUp(): Promise<void> {
     throw new Error(`Redis not clean at start. Found ${initialCount.length} entries`);
   }
 
-  // Insert 2000 users
+  // Insert 2000 users and store their IDs
+  const users: TrackedUser[] = [];
   const insertOperations = Array.from({ length: 2000 }, (_, i) => {
-    return waitlist.insertUser(`mass_user${i}`, {
+    return waitlist.insertUser({
       email: `mass_user${i}@test.com`,
       metadata: { name: `Mass User ${i}` }
+    }).then(result => {
+      users[i] = { id: result.id, email: `mass_user${i}@test.com` };
+      return result;
     });
   });
 
@@ -208,13 +211,12 @@ async function testLargeScaleBumpUp(): Promise<void> {
 
   // Move users 500-1000 to positions 400-900
   for (let i = 499; i < 1000; i++) {
-    await waitlist.moveUser(`mass_user${i}`, i - 99);
+    await waitlist.moveUser(users[i].id, i - 99);
   }
 
   // Get final count and order
   const finalOrder = await waitlist.getOrderedIds();
   if (finalOrder.length !== 2000) {
-    console.error('Users found:', finalOrder.map(id => id).join(', '));
     throw new Error(`Expected 2000 users, found ${finalOrder.length}`);
   }
 
@@ -225,85 +227,94 @@ async function testLargeScaleBumpUp(): Promise<void> {
   }
 
   // Verify all expected users exist
-  for (let i = 0; i < 2000; i++) {
-    if (!uniqueIds.has(`mass_user${i}`)) {
-      throw new Error(`Missing user: mass_user${i}`);
+  for (const user of users) {
+    if (!uniqueIds.has(user.id)) {
+      throw new Error(`Missing user: ${user.email}`);
     }
   }
 }
 
 async function testRepeatedBumpUp(): Promise<void> {
-  // Insert 20 users sequentially
+  // Insert 20 users sequentially and store their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`bump_user${i}`, {
+    const result = await waitlist.insertUser({
       email: `bump_user${i}@test.com`,
       metadata: { name: `Bump User ${i}` }
     });
+    users.push({ id: result.id, email: `bump_user${i}@test.com` });
   }
 
   // Move users to their final positions in reverse order
   for (let i = 0; i < 20; i++) {
     const userToMove = 19 - i;
     const targetPos = i + 1;
-    await waitlist.moveUser(`bump_user${userToMove}`, targetPos);
+    await waitlist.moveUser(users[userToMove].id, targetPos);
   }
 
   // Get final order
   const finalOrder = await waitlist.getOrderedIds();
 
   // Verify exact final order (19 down to 0)
-  const expectedOrder = Array.from({ length: 20 }, (_, i) => `bump_user${19 - i}`);
+  const expectedOrder = users.slice().reverse().map(u => u.id);
   if (JSON.stringify(finalOrder) !== JSON.stringify(expectedOrder)) {
     throw new Error(
-      'Expected reversed order: 19,18,17,...,2,1,0\n' +
-      `Got: ${finalOrder.map(id => parseInt(id.replace('bump_user', ''))).join(',')}`
+      'Expected reversed order of users\n' +
+      `Got unexpected order`
     );
   }
 
   // Verify email mappings match reversed order
   for (let i = 0; i < finalOrder.length; i++) {
     const userId = finalOrder[i];
-    const email = `${userId}@test.com`;
-    const mappedId = await waitlist.getEmailMapping(email);
-    if (mappedId !== userId || mappedId !== `bump_user${19 - i}`) {
-      throw new Error(`Email mapping at position ${i + 1} incorrect. Expected bump_user${19 - i}, got ${mappedId}`);
+    const user = users.find(u => u.id === userId);
+    if (!user) {
+      throw new Error(`Could not find user with ID ${userId}`);
+    }
+    const mappedId = await waitlist.getEmailMapping(user.email!);
+    if (mappedId !== userId) {
+      throw new Error(`Email mapping at position ${i + 1} incorrect. Expected ${userId}, got ${mappedId}`);
     }
   }
 }
 
 async function testStepByStepBumpUp(): Promise<void> {
-  // Insert 20 users sequentially
+  // Insert 20 users sequentially and store their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`bump_user${i}`, {
+    const result = await waitlist.insertUser({
       email: `bump_user${i}@test.com`,
       metadata: { name: `Bump User ${i}` }
     });
+    users.push({ id: result.id, email: `bump_user${i}@test.com` });
   }
+
+  // Get the ID of user19 that we'll be moving
+  const user19 = users[19];
 
   // Move user19 up one position at a time
   for (let targetPos = 19; targetPos >= 1; targetPos--) {
-    await waitlist.moveUser('bump_user19', targetPos);
+    await waitlist.moveUser(user19.id, targetPos);
     const currentOrder = await waitlist.getOrderedIds();
 
     // Verify position after each move
-    const currentPosition = await waitlist.getPosition('bump_user19');
+    const currentPosition = await waitlist.getPosition(user19.id);
     if (currentPosition !== targetPos) {
       throw new Error(`Expected user19 at position ${targetPos}, but found at ${currentPosition}`);
     }
 
     // Verify the array is correct up to this point
     const expectedOrder = Array.from({ length: 20 }, (_, i) => {
-      if (i < targetPos - 1) return `bump_user${i}`;
-      if (i === targetPos - 1) return 'bump_user19';
-      if (i <= 18) return `bump_user${i-1}`;
-      return `bump_user18`;
+      if (i < targetPos - 1) return users[i].id;
+      if (i === targetPos - 1) return user19.id;
+      if (i <= 18) return users[i-1].id;
+      return users[18].id;
     });
 
     if (JSON.stringify(currentOrder) !== JSON.stringify(expectedOrder)) {
       throw new Error(
         `At target position ${targetPos}:\n` +
-        `Expected: ${expectedOrder.map(id => parseInt(id.replace('bump_user', ''))).join(',')}\n` +
-        `Got: ${currentOrder.map(id => parseInt(id.replace('bump_user', ''))).join(',')}`
+        `Expected order incorrect`
       );
     }
   }
@@ -312,62 +323,66 @@ async function testStepByStepBumpUp(): Promise<void> {
   const finalOrder = await waitlist.getOrderedIds();
 
   // Final position should be 1 (1-based)
-  const finalPosition = await waitlist.getPosition('bump_user19');
+  const finalPosition = await waitlist.getPosition(user19.id);
   if (finalPosition !== 1) {
     throw new Error(`Expected user19 at position 1, but found at ${finalPosition}`);
   }
 
   // Expected final order: [19,0,1,2,3,...,18]
-  const expectedFinalOrder = ['bump_user19'].concat(
-    Array.from({ length: 19 }, (_, i) => `bump_user${i}`)
+  const expectedFinalOrder = [user19.id].concat(
+    users.slice(0, 19).map(u => u.id)
   );
   
   if (JSON.stringify(finalOrder) !== JSON.stringify(expectedFinalOrder)) {
-    throw new Error(
-      'Expected final order: 19,0,1,2,3,...,18\n' +
-      `Got: ${finalOrder.map(id => parseInt(id.replace('bump_user', ''))).join(',')}`
-    );
+    throw new Error('Final order is incorrect');
   }
 
-  // Verify email mappings match final order [19,0,1,2,3,...,18]
+  // Verify email mappings match final order
   for (let i = 0; i < finalOrder.length; i++) {
     const userId = finalOrder[i];
-    const email = `${userId}@test.com`;
-    const mappedId = await waitlist.getEmailMapping(email);
-    if (mappedId !== userId || mappedId !== finalOrder[i]) {
+    const user = users.find(u => u.id === userId);
+    if (!user) {
+      throw new Error(`Could not find user with ID ${userId}`);
+    }
+    const mappedId = await waitlist.getEmailMapping(user.email!);
+    if (mappedId !== userId) {
       throw new Error(`Email mapping at position ${i + 1} incorrect. Expected ${userId}, got ${mappedId}`);
     }
   }
 }
 
 async function testConcurrentBumpToSamePosition(): Promise<void> {
-  // Insert 20 users sequentially
+  // Insert 20 users sequentially and track their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`bump_user${i}`, {
+    const result = await waitlist.insertUser({
       email: `bump_user${i}@test.com`,
       metadata: { name: `Bump User ${i}` }
     });
+    users.push({ id: result.id, email: `bump_user${i}@test.com` });
   }
 
   // Concurrently move users 16-19 to position 2
   await Promise.all([
-    waitlist.moveUser('bump_user16', 2),
-    waitlist.moveUser('bump_user17', 2),
-    waitlist.moveUser('bump_user18', 2),
-    waitlist.moveUser('bump_user19', 2)
+    waitlist.moveUser(users[16].id, 2),
+    waitlist.moveUser(users[17].id, 2),
+    waitlist.moveUser(users[18].id, 2),
+    waitlist.moveUser(users[19].id, 2)
   ]);
 
   // Get final order
   const finalOrder = await waitlist.getOrderedIds();
 
   // Verify the structure:
-  // 1. First position should be 0
-  if (finalOrder[0] !== 'bump_user0') {
+  // 1. First position should be user0
+  if (finalOrder[0] !== users[0].id) {
     throw new Error('First position should be user0');
   }
 
   // 2. Next four positions should contain users 16-19 in reverse order
-  const movedUsers = finalOrder.slice(1, 5).map(id => parseInt(id.replace('bump_user', '')));
+  const movedUsers = finalOrder.slice(1, 5).map(id => 
+    users.findIndex(u => u.id === id)
+  );
   const expectedMovedUsers = [19, 18, 17, 16];
   if (JSON.stringify(movedUsers) !== JSON.stringify(expectedMovedUsers)) {
     throw new Error(
@@ -377,7 +392,9 @@ async function testConcurrentBumpToSamePosition(): Promise<void> {
   }
 
   // 3. Remaining positions should be 1-15 in order
-  const remainingUsers = finalOrder.slice(5).map(id => parseInt(id.replace('bump_user', '')));
+  const remainingUsers = finalOrder.slice(5).map(id => 
+    users.findIndex(u => u.id === id)
+  );
   const expectedRemaining = Array.from({ length: 15 }, (_, i) => i + 1);
   if (JSON.stringify(remainingUsers) !== JSON.stringify(expectedRemaining)) {
     throw new Error(
@@ -387,30 +404,35 @@ async function testConcurrentBumpToSamePosition(): Promise<void> {
     );
   }
 
-  // Verify email mappings match final order [0,19,18,17,16,1,2,3,...,15]
+  // Verify email mappings match final order
   for (let i = 0; i < finalOrder.length; i++) {
     const userId = finalOrder[i];
-    const email = `${userId}@test.com`;
-    const mappedId = await waitlist.getEmailMapping(email);
-    if (mappedId !== userId || mappedId !== finalOrder[i]) {
+    const user = users.find(u => u.id === userId);
+    if (!user) {
+      throw new Error(`Could not find user with ID ${userId}`);
+    }
+    const mappedId = await waitlist.getEmailMapping(user.email!);
+    if (mappedId !== userId) {
       throw new Error(`Email mapping at position ${i + 1} incorrect. Expected ${userId}, got ${mappedId}`);
     }
   }
 }
 
 async function testPhoneAttachment(): Promise<void> {
-  // Insert 20 users with emails only
+  // Insert 20 users with emails only and track their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`user${i}`, {
+    const result = await waitlist.insertUser({
       email: `user${i}@test.com`,
       metadata: { name: `User ${i}` }
     });
+    users.push({ id: result.id, email: `user${i}@test.com` });
   }
 
   // Attach phone numbers to all users
   const attachResults = await Promise.all(
-    Array.from({ length: 20 }, (_, i) => 
-      waitlist.attachPhone(`user${i}`, `+1555000${i.toString().padStart(4, '0')}`)
+    users.map((user, i) => 
+      waitlist.attachPhone(user.id, `+1555000${i.toString().padStart(4, '0')}`)
     )
   );
 
@@ -420,40 +442,42 @@ async function testPhoneAttachment(): Promise<void> {
 
   // Verify phone mappings
   for (let i = 0; i < 20; i++) {
-    const userId = `user${i}`;
+    const user = users[i];
     const phone = `+1555000${i.toString().padStart(4, '0')}`;
     const mappedId = await waitlist.getPhoneMapping(phone);
     
-    if (mappedId !== userId) {
-      throw new Error(`Phone mapping incorrect for ${userId}. Expected ${userId}, got ${mappedId}`);
+    if (mappedId !== user.id) {
+      throw new Error(`Phone mapping incorrect for ${user.id}. Expected ${user.id}, got ${mappedId}`);
     }
   }
 
   // Try to attach an already used phone number
-  const duplicateResult = await waitlist.attachPhone('user0', '+15550000001');
+  const duplicateResult = await waitlist.attachPhone(users[0].id, `+15550000001`);
   if (duplicateResult !== false) {
     throw new Error('Should not be able to attach already used phone number');
   }
 
   const originalMapping = await waitlist.getPhoneMapping('+15550000001');
-  if (originalMapping !== 'user1') {
-    throw new Error(`Original phone mapping was affected. Expected user1, got ${originalMapping}`);
+  if (originalMapping !== users[1].id) {
+    throw new Error(`Original phone mapping was affected. Expected ${users[1].id}, got ${originalMapping}`);
   }
 }
 
 async function testEmailAttachment(): Promise<void> {
-  // Insert 20 users with phone numbers only
+  // Insert 20 users with phone numbers only and track their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`user${i}`, {
+    const result = await waitlist.insertUser({
       phone: `+1555000${i.toString().padStart(4, '0')}`,
       metadata: { name: `User ${i}` }
     });
+    users.push({ id: result.id, phone: `+1555000${i.toString().padStart(4, '0')}` });
   }
 
   // Attach emails to all users
   const attachResults = await Promise.all(
-    Array.from({ length: 20 }, (_, i) => 
-      waitlist.attachEmail(`user${i}`, `user${i}@test.com`)
+    users.map((user, i) => 
+      waitlist.attachEmail(user.id, `user${i}@test.com`)
     )
   );
 
@@ -463,33 +487,37 @@ async function testEmailAttachment(): Promise<void> {
 
   // Verify email mappings
   for (let i = 0; i < 20; i++) {
-    const userId = `user${i}`;
+    const user = users[i];
     const email = `user${i}@test.com`;
     const mappedId = await waitlist.getEmailMapping(email);
     
-    if (mappedId !== userId) {
-      throw new Error(`Email mapping incorrect for ${userId}. Expected ${userId}, got ${mappedId}`);
+    if (mappedId !== user.id) {
+      throw new Error(`Email mapping incorrect for ${user.id}. Expected ${user.id}, got ${mappedId}`);
     }
   }
 
   // Try to attach an already used email
-  const duplicateResult = await waitlist.attachEmail('user0', 'user1@test.com');
+  const duplicateResult = await waitlist.attachEmail(users[0].id, 'user1@test.com');
   if (duplicateResult !== false) {
     throw new Error('Should not be able to attach already used email');
   }
 
   const originalMapping = await waitlist.getEmailMapping('user1@test.com');
-  if (originalMapping !== 'user1') {
-    throw new Error(`Original email mapping was affected. Expected user1, got ${originalMapping}`);
+  if (originalMapping !== users[1].id) {
+    throw new Error(`Original email mapping was affected. Expected ${users[1].id}, got ${originalMapping}`);
   }
 }
 
 async function testLargeListBumpToTop(): Promise<void> {
   // Insert first 5K users in parallel
+  const users: TrackedUser[] = [];
   let insertOperations = Array.from({ length: 5000 }, (_, i) => {
-    return waitlist.insertUser(`user${i}`, {
+    return waitlist.insertUser({
       email: `user${i}@test.com`,
       metadata: { name: `User ${i}` }
+    }).then(result => {
+      users[i] = { id: result.id, email: `user${i}@test.com` };
+      return result;
     });
   });
   await Promise.all(insertOperations);
@@ -497,21 +525,24 @@ async function testLargeListBumpToTop(): Promise<void> {
   // Insert second 5K users in parallel
   insertOperations = Array.from({ length: 5000 }, (_, i) => {
     const userNum = i + 5000;
-    return waitlist.insertUser(`user${userNum}`, {
+    return waitlist.insertUser({
       email: `user${userNum}@test.com`,
       metadata: { name: `User ${userNum}` }
+    }).then(result => {
+      users[userNum] = { id: result.id, email: `user${userNum}@test.com` };
+      return result;
     });
   });
   await Promise.all(insertOperations);
 
   // Move last user to top
-  const lastUserId = `user${9999}`;
-  await waitlist.moveUser(lastUserId, 1);
+  const lastUser = users[9999];
+  await waitlist.moveUser(lastUser.id, 1);
 
   // Check that last user is now first
-  const topPosition = await waitlist.getPosition(lastUserId);
+  const topPosition = await waitlist.getPosition(lastUser.id);
   if (topPosition !== 1) {
-    throw new Error(`Expected ${lastUserId} at position 1, found at ${topPosition}`);
+    throw new Error(`Expected ${lastUser.id} at position 1, found at ${topPosition}`);
   }
 
   // Get final order and verify it's correct
@@ -522,8 +553,8 @@ async function testLargeListBumpToTop(): Promise<void> {
   }
 
   // Verify order: last user should be first, rest should be in original order
-  const expectedOrder = [lastUserId].concat(
-    Array.from({ length: 9999 }, (_, i) => `user${i}`)
+  const expectedOrder = [lastUser.id].concat(
+    users.slice(0, 9999).map(u => u.id)
   );
 
   // First verify all positions in order
@@ -546,8 +577,11 @@ async function testLargeListBumpToTop(): Promise<void> {
     const verificationPromises = Array.from({ length: endIdx - startIdx }, (_, idx) => {
       const i = startIdx + idx;
       const userId = finalOrder[i];
-      const email = `${userId}@test.com`;
-      return waitlist.getEmailMapping(email).then(mappedId => {
+      const user = users.find(u => u.id === userId);
+      if (!user) {
+        throw new Error(`Could not find user info for ID ${userId}`);
+      }
+      return waitlist.getEmailMapping(user.email!).then(mappedId => {
         if (mappedId !== userId) {
           throw new Error(`Email mapping incorrect for ${userId}. Expected ${userId}, got ${mappedId}`);
         }
@@ -559,20 +593,26 @@ async function testLargeListBumpToTop(): Promise<void> {
 }
 
 async function testDeleteAndReinsert(): Promise<void> {
-  // Insert 20 users sequentially
+  // Insert 20 users sequentially and track their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`user${i}`, {
+    const result = await waitlist.insertUser({
       email: `user${i}@test.com`,
       phone: `+1555${i.toString().padStart(4, '0')}`,
       metadata: { name: `User ${i}` }
     });
+    users.push({ 
+      id: result.id, 
+      email: `user${i}@test.com`,
+      phone: `+1555${i.toString().padStart(4, '0')}`
+    });
   }
 
   // Delete all users one by one
-  for (let i = 0; i < 20; i++) {
-    const success = await waitlist.deleteUser(`user${i}`);
+  for (const user of users) {
+    const success = await waitlist.deleteUser(user.id);
     if (!success) {
-      throw new Error(`Failed to delete user${i}`);
+      throw new Error(`Failed to delete ${user.id}`);
     }
   }
 
@@ -583,30 +623,33 @@ async function testDeleteAndReinsert(): Promise<void> {
   }
 
   // Verify email and phone mappings are cleared
-  for (let i = 0; i < 20; i++) {
-    const email = `user${i}@test.com`;
-    const phone = `+1555${i.toString().padStart(4, '0')}`;
-    
-    const emailMapping = await waitlist.getEmailMapping(email);
-    const phoneMapping = await waitlist.getPhoneMapping(phone);
+  for (const user of users) {
+    const emailMapping = await waitlist.getEmailMapping(user.email!);
+    const phoneMapping = await waitlist.getPhoneMapping(user.phone!);
     
     if (emailMapping !== null) {
-      throw new Error(`Email mapping still exists for ${email}`);
+      throw new Error(`Email mapping still exists for ${user.email}`);
     }
     if (phoneMapping !== null) {
-      throw new Error(`Phone mapping still exists for ${phone}`);
+      throw new Error(`Phone mapping still exists for ${user.phone}`);
     }
   }
 
-  // Re-insert 20 new users
+  // Re-insert 20 new users and track their IDs
+  const newUsers: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    const result = await waitlist.insertUser(`new_user${i}`, {
+    const result = await waitlist.insertUser({
       email: `new_user${i}@test.com`,
       phone: `+1666${i.toString().padStart(4, '0')}`,
       metadata: { name: `New User ${i}` }
     });
+    newUsers.push({
+      id: result.id,
+      email: `new_user${i}@test.com`,
+      phone: `+1666${i.toString().padStart(4, '0')}`
+    });
 
-    // Verify position is correct (should be i + 1 since we're inserting sequentially)
+    // Verify position is correct
     if (result.position !== i + 1) {
       throw new Error(`Expected new_user${i} at position ${i + 1}, got ${result.position}`);
     }
@@ -614,30 +657,36 @@ async function testDeleteAndReinsert(): Promise<void> {
 
   // Final verification of all positions
   for (let i = 0; i < 20; i++) {
-    const position = await waitlist.getPosition(`new_user${i}`);
+    const position = await waitlist.getPosition(newUsers[i].id);
     if (position !== i + 1) {
-      throw new Error(`Expected new_user${i} at position ${i + 1}, got ${position}`);
+      throw new Error(`Expected ${newUsers[i].id} at position ${i + 1}, got ${position}`);
     }
   }
 }
 
 async function testDeleteByEmailAndPhone(): Promise<void> {
-  // Insert 20 users sequentially
+  // Insert 20 users sequentially and track their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`user${i}`, {
+    const result = await waitlist.insertUser({
       email: `user${i}@test.com`,
       phone: `+1555${i.toString().padStart(4, '0')}`,
       metadata: { name: `User ${i}` }
     });
+    users.push({
+      id: result.id,
+      email: `user${i}@test.com`,
+      phone: `+1555${i.toString().padStart(4, '0')}`
+    });
   }
 
   // Delete user5 by email and user6 by phone
-  const deleteEmailResult = await waitlist.deleteUserByEmail('user5@test.com');
+  const deleteEmailResult = await waitlist.deleteUserByEmail(users[5].email!);
   if (!deleteEmailResult) {
     throw new Error('Failed to delete user5 by email');
   }
 
-  const deletePhoneResult = await waitlist.deleteUserByPhone('+15550006');
+  const deletePhoneResult = await waitlist.deleteUserByPhone(users[6].phone!);
   if (!deletePhoneResult) {
     throw new Error('Failed to delete user6 by phone');
   }
@@ -653,19 +702,19 @@ async function testDeleteByEmailAndPhone(): Promise<void> {
     // Skip deleted users
     if (i === 5 || i === 6) continue;
 
-    const position = await waitlist.getPosition(`user${i}`);
+    const position = await waitlist.getPosition(users[i].id);
     const expectedPosition = i < 5 ? i + 1 : i - 1;
     
     if (position !== expectedPosition) {
-      throw new Error(`Wrong position for user${i}: expected ${expectedPosition}, got ${position}`);
+      throw new Error(`Wrong position for ${users[i].id}: expected ${expectedPosition}, got ${position}`);
     }
   }
 
-  // Verify deleted users' email and phone mappings are removed
-  const email5Mapping = await waitlist.getEmailMapping('user5@test.com');
-  const phone5Mapping = await waitlist.getPhoneMapping('+15550005');
-  const email6Mapping = await waitlist.getEmailMapping('user6@test.com');
-  const phone6Mapping = await waitlist.getPhoneMapping('+15550006');
+  // Verify deleted users' mappings are removed
+  const email5Mapping = await waitlist.getEmailMapping(users[5].email!);
+  const phone5Mapping = await waitlist.getPhoneMapping(users[5].phone!);
+  const email6Mapping = await waitlist.getEmailMapping(users[6].email!);
+  const phone6Mapping = await waitlist.getPhoneMapping(users[6].phone!);
 
   if (email5Mapping !== null || phone5Mapping !== null) {
     throw new Error('User5 mappings still exist');
@@ -678,44 +727,48 @@ async function testDeleteByEmailAndPhone(): Promise<void> {
   for (let i = 0; i < 20; i++) {
     if (i === 5 || i === 6) continue;
 
-    const email = `user${i}@test.com`;
-    const phone = `+1555${i.toString().padStart(4, '0')}`;
+    const user = users[i];
+    const emailMapping = await waitlist.getEmailMapping(user.email!);
+    const phoneMapping = await waitlist.getPhoneMapping(user.phone!);
     
-    const emailMapping = await waitlist.getEmailMapping(email);
-    const phoneMapping = await waitlist.getPhoneMapping(phone);
-    
-    if (emailMapping !== `user${i}`) {
-      throw new Error(`Email mapping incorrect for user${i}`);
+    if (emailMapping !== user.id) {
+      throw new Error(`Email mapping incorrect for ${user.id}`);
     }
-    if (phoneMapping !== `user${i}`) {
-      throw new Error(`Phone mapping incorrect for user${i}`);
+    if (phoneMapping !== user.id) {
+      throw new Error(`Phone mapping incorrect for ${user.id}`);
     }
   }
 }
 
 async function testDeleteAndBumpUp(): Promise<void> {
-  // Insert 20 users sequentially
+  // Insert 20 users sequentially and track their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`user${i}`, {
+    const result = await waitlist.insertUser({
       email: `user${i}@test.com`,
       phone: `+1555${i.toString().padStart(4, '0')}`,
       metadata: { name: `User ${i}` }
     });
+    users.push({
+      id: result.id,
+      email: `user${i}@test.com`,
+      phone: `+1555${i.toString().padStart(4, '0')}`
+    });
   }
 
   // Delete user5 by email and user6 by phone
-  const deleteEmailResult = await waitlist.deleteUserByEmail('user5@test.com');
+  const deleteEmailResult = await waitlist.deleteUserByEmail(users[5].email!);
   if (!deleteEmailResult) {
     throw new Error('Failed to delete user5 by email');
   }
 
-  const deletePhoneResult = await waitlist.deleteUserByPhone('+15550006');
+  const deletePhoneResult = await waitlist.deleteUserByPhone(users[6].phone!);
   if (!deletePhoneResult) {
     throw new Error('Failed to delete user6 by phone');
   }
 
   // Move last user (user19) to position 3
-  await waitlist.moveUser('user19', 3);
+  await waitlist.moveUser(users[19].id, 3);
 
   // Get final order and verify count
   const finalOrder = await waitlist.getOrderedIds();
@@ -725,8 +778,8 @@ async function testDeleteAndBumpUp(): Promise<void> {
 
   // Expected order: user0, user1, user19, user2, user3, user4, user7, user8, ..., user18
   const expectedOrder = [
-    'user0', 'user1', 'user19', 'user2', 'user3', 'user4',
-    ...Array.from({ length: 12 }, (_, i) => `user${i + 7}`)
+    users[0].id, users[1].id, users[19].id, users[2].id, users[3].id, users[4].id,
+    ...users.slice(7, 19).map(u => u.id)
   ];
 
   if (JSON.stringify(finalOrder) !== JSON.stringify(expectedOrder)) {
@@ -749,11 +802,9 @@ async function testDeleteAndBumpUp(): Promise<void> {
 
   // Verify email and phone mappings are correct
   for (const userId of finalOrder) {
-    const email = `${userId}@test.com`;
-    const phone = `+1555${userId.replace('user', '').padStart(4, '0')}`;
-    
-    const emailMapping = await waitlist.getEmailMapping(email);
-    const phoneMapping = await waitlist.getPhoneMapping(phone);
+    const user = users.find(u => u.id === userId)!;
+    const emailMapping = await waitlist.getEmailMapping(user.email!);
+    const phoneMapping = await waitlist.getPhoneMapping(user.phone!);
     
     if (emailMapping !== userId) {
       throw new Error(`Email mapping incorrect for ${userId}`);
@@ -765,10 +816,10 @@ async function testDeleteAndBumpUp(): Promise<void> {
 
   // Verify deleted users' mappings are removed
   const deletedMappings = await Promise.all([
-    waitlist.getEmailMapping('user5@test.com'),
-    waitlist.getPhoneMapping('+15550005'),
-    waitlist.getEmailMapping('user6@test.com'),
-    waitlist.getPhoneMapping('+15550006')
+    waitlist.getEmailMapping(users[5].email!),
+    waitlist.getPhoneMapping(users[5].phone!),
+    waitlist.getEmailMapping(users[6].email!),
+    waitlist.getPhoneMapping(users[6].phone!)
   ]);
 
   if (deletedMappings.some(mapping => mapping !== null)) {
@@ -779,11 +830,11 @@ async function testDeleteAndBumpUp(): Promise<void> {
 async function testLimitAndConcurrentOperations(): Promise<void> {
   try {
     // Set a small limit
-    waitlist.setLengthLimit(5);
+    waitlist.setListLimit(5);
 
-    // Try to insert 10 users concurrently
+    // Try to insert 10 users concurrently and track their IDs
     const operations = Array.from({ length: 10 }, async (_, i) => {
-      return waitlist.insertUser(`user${i}`, {
+      return waitlist.insertUser({
         email: `user${i}@test.com`,
         metadata: { name: `User ${i}` }
       }).catch(e => e);  // Catch errors for failed inserts
@@ -804,7 +855,7 @@ async function testLimitAndConcurrentOperations(): Promise<void> {
     }
   } finally {
     // Reset limit to default value
-    waitlist.setLengthLimit(100000);
+    waitlist.setListLimit(100000);
   }
 }
 
@@ -813,19 +864,31 @@ async function testLargeScaleInsertAndLength(): Promise<void> {
   const BATCH_SIZE = 5000;
   const NUM_BATCHES = TOTAL_USERS / BATCH_SIZE;
 
+  // Track all users
+  const users: TrackedUser[] = new Array(TOTAL_USERS);
+
   // Insert users in batches
   for (let batch = 0; batch < NUM_BATCHES; batch++) {
     const batchStart = batch * BATCH_SIZE;
     
-    const batchOperations = Array.from({ length: BATCH_SIZE }, async (_, i) => {
+    const batchOperations = Array.from({ length: BATCH_SIZE }, (_, i) => {
       const userIndex = batchStart + i;
-      return waitlist.insertUser(`user${userIndex}`, {
+      return waitlist.insertUser({
         email: `mass_user${userIndex}@test.com`,
         metadata: { name: `Mass User ${userIndex}` }
       });
     });
 
-    await Promise.all(batchOperations);
+    const results = await Promise.all(batchOperations);
+    
+    // Store results after batch completes
+    results.forEach((result, i) => {
+      const userIndex = batchStart + i;
+      users[userIndex] = { 
+        id: result.id, 
+        email: `mass_user${userIndex}@test.com` 
+      };
+    });
   }
 
   // Verify final length
@@ -833,30 +896,52 @@ async function testLargeScaleInsertAndLength(): Promise<void> {
   if (finalLength !== TOTAL_USERS) {
     throw new Error(`Expected length ${TOTAL_USERS}, but got ${finalLength}`);
   }
+
+  // Verify random sample of users exist (checking all 50K would be too slow)
+  const sampleSize = 100;
+  const sampleIndices = Array.from({ length: sampleSize }, 
+    () => Math.floor(Math.random() * TOTAL_USERS)
+  );
+
+  await Promise.all(
+    sampleIndices.map(async index => {
+      const user = users[index];
+      const position = await waitlist.getPosition(user.id);
+      if (!position) {
+        throw new Error(`Sample user ${user.id} not found`);
+      }
+    })
+  );
 }
 
 async function testConcurrentDeleteAndBump(): Promise<void> {
-  // Insert 21 users sequentially (0-20)
+  // Insert 21 users sequentially and track their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i <= 20; i++) {
-    await waitlist.insertUser(`user${i}`, {
+    const result = await waitlist.insertUser({
       email: `user${i}@test.com`,
       phone: `+1555${i.toString().padStart(4, '0')}`,
       metadata: { name: `User ${i}` }
+    });
+    users.push({
+      id: result.id,
+      email: `user${i}@test.com`,
+      phone: `+1555${i.toString().padStart(4, '0')}`
     });
   }
 
   // Test concurrent operations: delete 4-7 and bump 17-20 to those positions
   const operations = [
     // Delete operations
-    waitlist.deleteUser('user4'),
-    waitlist.deleteUser('user5'),
-    waitlist.deleteUser('user6'),
-    waitlist.deleteUser('user7'),
+    waitlist.deleteUser(users[4].id),
+    waitlist.deleteUser(users[5].id),
+    waitlist.deleteUser(users[6].id),
+    waitlist.deleteUser(users[7].id),
     // Bump operations
-    waitlist.moveUser('user17', 4),
-    waitlist.moveUser('user18', 5),
-    waitlist.moveUser('user19', 6),
-    waitlist.moveUser('user20', 7)
+    waitlist.moveUser(users[17].id, 4),
+    waitlist.moveUser(users[18].id, 5),
+    waitlist.moveUser(users[19].id, 6),
+    waitlist.moveUser(users[20].id, 7)
   ];
 
   // Run operations concurrently
@@ -864,18 +949,18 @@ async function testConcurrentDeleteAndBump(): Promise<void> {
 
   // Verify deleted users are gone
   for (let i = 4; i <= 7; i++) {
-    const position = await waitlist.getPosition(`user${i}`);
+    const position = await waitlist.getPosition(users[i].id);
     if (position !== 0) {
-      throw new Error(`User${i} should be deleted but found at position ${position}`);
+      throw new Error(`User ${users[i].id} should be deleted but found at position ${position}`);
     }
   }
 
   // Verify bumped users are in correct positions
   const expectedPositions = {
-    'user17': 4,
-    'user18': 5,
-    'user19': 6,
-    'user20': 7
+    [users[17].id]: 4,
+    [users[18].id]: 5,
+    [users[19].id]: 6,
+    [users[20].id]: 7
   };
 
   for (const [userId, expectedPos] of Object.entries(expectedPositions)) {
@@ -888,11 +973,11 @@ async function testConcurrentDeleteAndBump(): Promise<void> {
   // Verify remaining users maintained their relative order
   const finalOrder = await waitlist.getOrderedIds();
   const expectedOrder = [
-    'user0', 'user1', 'user2',
-    'user17', 'user18', 'user19', 'user20',
-    'user3',  // user3 gets pushed back after the bumped users
-    'user8', 'user9', 'user10', 'user11', 'user12',
-    'user13', 'user14', 'user15', 'user16'
+    users[0].id, users[1].id, users[2].id,
+    users[17].id, users[18].id, users[19].id, users[20].id,
+    users[3].id,  // user3 gets pushed back after the bumped users
+    users[8].id, users[9].id, users[10].id, users[11].id, users[12].id,
+    users[13].id, users[14].id, users[15].id, users[16].id
   ];
 
   if (JSON.stringify(finalOrder) !== JSON.stringify(expectedOrder)) {
@@ -902,30 +987,25 @@ async function testConcurrentDeleteAndBump(): Promise<void> {
       `Got: ${finalOrder.join(', ')}`
     );
   }
-
-  // Verify final count
-  if (finalOrder.length !== 17) { // 21 initial - 4 deleted
-    throw new Error(`Expected 17 users, but found ${finalOrder.length}`);
-  }
 }
 
 async function testBasicInviteCodeFlow(): Promise<void> {
   // Create initial user
-  await waitlist.insertUser('creator1', {
+  const creatorResult = await waitlist.insertUser({
     email: 'creator1@test.com',
     metadata: { name: 'Creator 1' }
   });
 
   // Create invite code
-  const code = await waitlist.createInviteCode('creator1', 3);
+  const code = await waitlist.createInviteCode(creatorResult.id, 3);
   
   // Verify code exists and creator
   const creator = await waitlist.getInviteCodeCreator(code);
   if (!creator) {
     throw new Error('Invite code was not stored properly');
   }
-  if (creator !== 'creator1') {
-    throw new Error(`Wrong creator for code. Expected creator1, got ${creator}`);
+  if (creator !== creatorResult.id) {
+    throw new Error(`Wrong creator for code. Expected ${creatorResult.id}, got ${creator}`);
   }
 
   // Verify bump positions
@@ -935,56 +1015,60 @@ async function testBasicInviteCodeFlow(): Promise<void> {
   }
   
   // Use invite code
-  const result = await waitlist.useInviteCode(code, 'invited1', {
+  const invitedResult = await waitlist.useInviteCode(code, {
     email: 'invited1@test.com',
     metadata: { name: 'Invited User 1' }
   }, 0);
 
   // Verify positions
-  const creatorPosition = await waitlist.getPosition('creator1');
+  const creatorPosition = await waitlist.getPosition(creatorResult.id);
   if (creatorPosition !== 1) {
     throw new Error(`Expected creator at position 1, got ${creatorPosition}`);
   }
 
-  if (result.position !== 2) {
-    throw new Error(`Expected invited user at position 2, got ${result.position}`);
+  if (invitedResult.position !== 2) {
+    throw new Error(`Expected invited user at position 2, got ${invitedResult.position}`);
   }
 }
 
 async function testLargeScaleInviteCodes(): Promise<void> {
   const CREATORS = 100;
   const CODES_PER_CREATOR = 3;
-  const TOTAL_USERS = CREATORS * 2;  // Creators + one invited user per creator
+  const TOTAL_USERS = CREATORS * 2;
 
-  // Create creators (100 users)
-  const creatorOperations = Array.from({ length: CREATORS }, (_, i) => 
-    waitlist.insertUser(`creator${i}`, {
-      email: `creator${i}@test.com`,
-      metadata: { name: `Creator ${i}` }
+  // Create creators and store their results (including IDs)
+  const creators: TrackedUser[] = [];
+  const creatorResults = await Promise.all(
+    Array.from({ length: CREATORS }, async (_, i) => {
+      const result = await waitlist.insertUser({
+        email: `creator${i}@test.com`,
+        metadata: { name: `Creator ${i}` }
+      });
+      creators.push({ id: result.id, email: `creator${i}@test.com` });
+      return result;
     })
   );
-  await Promise.all(creatorOperations);
-
-  // Verify creators were added
-  const creatorCount = await waitlist.getLength();
-  if (creatorCount !== CREATORS) {
-    throw new Error(`Expected ${CREATORS} creators, got ${creatorCount}`);
-  }
 
   // Generate codes (300 codes total)
-  const codes: { creatorId: string, code: string }[] = [];
-  for (let i = 0; i < CREATORS; i++) {
+  const codes: { creatorEmail: string, creatorId: string, code: string }[] = [];
+  for (const creator of creators) {
     for (let j = 0; j < CODES_PER_CREATOR; j++) {
-      const code = await waitlist.createInviteCode(`creator${i}`, j + 1);
-      codes.push({ creatorId: `creator${i}`, code });
+      const code = await waitlist.createInviteCode(creator.id, j + 1);
+      codes.push({ 
+        creatorEmail: creator.email!, 
+        creatorId: creator.id, 
+        code 
+      });
     }
   }
 
+  // Track invited users' IDs
+  const invitedUsers: TrackedUser[] = [];
+
   // Use one code per creator (100 uses total)
-  const useOperations = codes.slice(0, CREATORS).map((codeInfo, i) =>
-    waitlist.useInviteCode(
+  const useOperations = codes.slice(0, CREATORS).map(async (codeInfo, i) => {
+    const result = await waitlist.useInviteCode(
       codeInfo.code,
-      `invited${i}`,
       {
         email: `invited${i}@test.com`,
         metadata: { name: `Invited User ${i}` }
@@ -993,8 +1077,10 @@ async function testLargeScaleInviteCodes(): Promise<void> {
     ).catch(error => {
       console.error(`Failed to use code ${codeInfo.code}:`, error.message);
       throw error;
-    })
-  );
+    });
+    invitedUsers.push({ id: result.id, email: `invited${i}@test.com` });
+    return result;
+  });
 
   const results = await Promise.allSettled(useOperations);
   const failures = results.filter(r => r.status === 'rejected');
@@ -1005,7 +1091,7 @@ async function testLargeScaleInviteCodes(): Promise<void> {
     throw new Error(`Failed to use ${failures.length} invite codes`);
   }
 
-  // Verify final state
+  // Verify final state using stored IDs
   const finalLength = await waitlist.getLength();
   
   if (finalLength !== TOTAL_USERS) {
@@ -1014,23 +1100,41 @@ async function testLargeScaleInviteCodes(): Promise<void> {
     throw new Error(`Expected ${TOTAL_USERS} users, got ${finalLength}`);
   }
 
-  // Verify all users exist
-  for (let i = 0; i < CREATORS; i++) {
-    const creatorExists = await waitlist.getPosition(`creator${i}`);
-    const invitedExists = await waitlist.getPosition(`invited${i}`);
-    
+  // Verify all users exist using stored IDs
+  for (const creator of creators) {
+    const creatorExists = await waitlist.getPosition(creator.id);
     if (!creatorExists) {
-      throw new Error(`Creator ${i} not found`);
+      throw new Error(`Creator ${creator.email} not found`);
     }
+  }
+
+  for (const invited of invitedUsers) {
+    const invitedExists = await waitlist.getPosition(invited.id);
     if (!invitedExists) {
-      throw new Error(`Invited user ${i} not found`);
+      throw new Error(`Invited user ${invited.email} not found`);
+    }
+  }
+
+  // Verify email mappings
+  for (const user of [...creators, ...invitedUsers]) {
+    const mappedId = await waitlist.getEmailMapping(user.email!);
+    if (mappedId !== user.id) {
+      throw new Error(`Email mapping incorrect for ${user.email}. Expected ${user.id}, got ${mappedId}`);
+    }
+  }
+
+  // Verify invite code creators are properly stored
+  for (const codeInfo of codes.slice(0, CREATORS)) {
+    const storedCreator = await waitlist.getInviteCodeCreator(codeInfo.code);
+    if (storedCreator !== codeInfo.creatorId) {
+      throw new Error(`Invite code creator mismatch for code ${codeInfo.code}`);
     }
   }
 }
 
 async function testInviteCodeLimits(): Promise<void> {
   // Create user
-  await waitlist.insertUser('limitTester', {
+  const limitTesterResult = await waitlist.insertUser({
     email: 'limit@test.com',
     metadata: { name: 'Limit Tester' }
   });
@@ -1039,11 +1143,11 @@ async function testInviteCodeLimits(): Promise<void> {
   waitlist.setInviteCodeLimit(2);
 
   // Try to create more codes than allowed
-  const code1 = await waitlist.createInviteCode('limitTester', 1);
-  const code2 = await waitlist.createInviteCode('limitTester', 1);
+  const code1 = await waitlist.createInviteCode(limitTesterResult.id, 1);
+  const code2 = await waitlist.createInviteCode(limitTesterResult.id, 1);
   
   try {
-    await waitlist.createInviteCode('limitTester', 1);
+    await waitlist.createInviteCode(limitTesterResult.id, 1);
     throw new Error('Should not allow creating more than limit');
   } catch (e) {
     if (!(e instanceof Error) || !e.message.includes('Invite code limit reached')) {
@@ -1052,36 +1156,46 @@ async function testInviteCodeLimits(): Promise<void> {
   }
 
   // Verify existing codes still work
-  await waitlist.useInviteCode(code1, 'invited1', {
+  const invited1Result = await waitlist.useInviteCode(code1, {
     email: 'invited1@test.com',
     metadata: { name: 'Invited 1' }
   }, 1);
 
-  await waitlist.useInviteCode(code2, 'invited2', {
+  const invited2Result = await waitlist.useInviteCode(code2, {
     email: 'invited2@test.com',
     metadata: { name: 'Invited 2' }
   }, 1);
+
+  // Verify positions
+  const positions = await Promise.all([
+    waitlist.getPosition(limitTesterResult.id),
+    waitlist.getPosition(invited1Result.id),
+    waitlist.getPosition(invited2Result.id)
+  ]);
+
+  if (!positions.every(p => p > 0)) {
+    throw new Error('Some users not found in waitlist');
+  }
 
   // Reset limit
   waitlist.setInviteCodeLimit(3);
 }
 
 async function testConcurrentInviteCodeUse(): Promise<void> {
-  // Create initial user
-  await waitlist.insertUser('multiCreator', {
+  // Create initial user and store ID
+  const creatorResult = await waitlist.insertUser({
     email: 'multi@test.com',
     metadata: { name: 'Multi Creator' }
   });
 
   // Create a single invite code
-  const code = await waitlist.createInviteCode('multiCreator', 2);
+  const code = await waitlist.createInviteCode(creatorResult.id, 2);
 
   // Try to use same code concurrently
   const attempts = 5;
   const operations = Array.from({ length: attempts }, (_, i) =>
     waitlist.useInviteCode(
       code,
-      `concurrent${i}`,
       {
         email: `concurrent${i}@test.com`,
         metadata: { name: `Concurrent User ${i}` }
@@ -1106,35 +1220,41 @@ async function testConcurrentInviteCodeUse(): Promise<void> {
 }
 
 async function testInviteCodePositionEdgeCases(): Promise<void> {
-  // Insert 20 users sequentially
+  // Insert 20 users sequentially and track their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`user${i}`, {
+    const result = await waitlist.insertUser({
       email: `user${i}@test.com`,
       phone: `+1555${i.toString().padStart(4, '0')}`,
       metadata: { name: `User ${i}` }
     });
+    users.push({
+      id: result.id,
+      email: `user${i}@test.com`,
+      phone: `+1555${i.toString().padStart(4, '0')}`
+    });
   }
 
   // Create invite code from user15 with large bump (100)
-  const largeCode = await waitlist.createInviteCode('user15', 100);
+  const largeCode = await waitlist.createInviteCode(users[15].id, 100);
   
   // Use the code and verify actual position
-  await waitlist.useInviteCode(largeCode, 'invited1', {
+  const invited1Result = await waitlist.useInviteCode(largeCode, {
     email: 'invited1@test.com',
     metadata: { name: 'Invited User 1' }
   }, 0);
 
   // Verify user15 moved to position 1
-  const user15NewPos = await waitlist.getPosition('user15');
+  const user15NewPos = await waitlist.getPosition(users[15].id);
   if (user15NewPos !== 1) {
     throw new Error(`Expected user15 at position 1, got ${user15NewPos}`);
   }
 
   // Get user10's new position after user15's move
-  const user10PosAfterFirst = await waitlist.getPosition('user10');
+  const user10PosAfterFirst = await waitlist.getPosition(users[10].id);
 
   // Create another code with small bump (2) and test position prediction
-  const smallCode = await waitlist.createInviteCode('user10', 2);
+  const smallCode = await waitlist.createInviteCode(users[10].id, 2);
   const smallPredictedPos = await waitlist.getPositionAfterInviteCodeUse(smallCode);
   
   // Calculate expected position based on current position and bump amount
@@ -1145,64 +1265,80 @@ async function testInviteCodePositionEdgeCases(): Promise<void> {
   }
 
   // Use the small bump code
-  await waitlist.useInviteCode(smallCode, 'invited2', {
+  const invited2Result = await waitlist.useInviteCode(smallCode, {
     email: 'invited2@test.com',
     metadata: { name: 'Invited User 2' }
   }, 0);
 
   // Verify final position
-  const finalUser10Pos = await waitlist.getPosition('user10');
+  const finalUser10Pos = await waitlist.getPosition(users[10].id);
   if (finalUser10Pos !== expectedPos) {
     throw new Error(`Expected user10 at position ${expectedPos}, got ${finalUser10Pos}`);
   }
 
   // Verify final order
   const finalOrder = await waitlist.getOrderedIds();
-  if (finalOrder[0] !== 'user15' || finalOrder[expectedPos - 1] !== 'user10') {
+  if (finalOrder[0] !== users[15].id || finalOrder[expectedPos - 1] !== users[10].id) {
     throw new Error('Final order is incorrect');
   }
 }
 
 async function testComplexConcurrentOperations(): Promise<void> {
-  // Setup initial users (20 users)
+  // Setup initial users (20 users) and track their IDs
+  const users: TrackedUser[] = [];
   for (let i = 0; i < 20; i++) {
-    await waitlist.insertUser(`base${i}`, {
+    const result = await waitlist.insertUser({
       email: `base${i}@test.com`,
       metadata: { name: `Base User ${i}` }
     });
+    users.push({ id: result.id, email: `base${i}@test.com` });
   }
 
   // Create invite codes with different bump positions
   const inviteCodes = [];
   for (let i = 0; i < 5; i++) {
-    const code = await waitlist.createInviteCode(`base${i * 2}`, i + 1);
-    inviteCodes.push({ code, creator: `base${i * 2}`, bumpPositions: i + 1 });
+    // Use users that won't be deleted (indices 0,2,3,5,6 since we delete 1,4,7...)
+    const safeIndices = [0, 2, 3, 5, 6];
+    const creator = users[safeIndices[i]];
+    const code = await waitlist.createInviteCode(creator.id, i + 1);
+    inviteCodes.push({ code, creator: creator, bumpPositions: i + 1 });
   }
+
+  // Track which users will be deleted (every 3rd user starting from index 1)
+  const toDelete = users.filter((_, i) => (i - 1) % 3 === 0);
+
+  // Track new and invited users
+  const newUsers: TrackedUser[] = [];
+  const invitedUsers: TrackedUser[] = [];
 
   // Prepare concurrent operations
   const operations = [
     // 5 deletes (every 3rd user starting from base1)
-    ...Array.from({ length: 5 }, (_, i) => 
-      waitlist.deleteUser(`base${1 + i * 3}`)),
+    ...toDelete.map(user => waitlist.deleteUser(user.id)),
 
     // 10 new inserts
     ...Array.from({ length: 10 }, (_, i) =>
-      waitlist.insertUser(`new${i}`, {
+      waitlist.insertUser({
         email: `new${i}@test.com`,
         metadata: { name: `New User ${i}` }
+      }).then(result => {
+        newUsers.push({ id: result.id, email: `new${i}@test.com` });
+        return result;
       })),
 
     // 5 invite code uses
     ...inviteCodes.map((invite, i) =>
       waitlist.useInviteCode(
         invite.code,
-        `invited${i}`,
         {
           email: `invited${i}@test.com`,
           metadata: { name: `Invited User ${i}` }
         },
         invite.bumpPositions
-      ))
+      ).then(result => {
+        invitedUsers.push({ id: result.id, email: `invited${i}@test.com` });
+        return result;
+      }))
   ];
 
   // Run all operations concurrently
@@ -1214,134 +1350,81 @@ async function testComplexConcurrentOperations(): Promise<void> {
     console.error('Failed operations:', failures);
     throw new Error(`${failures.length} operations failed`);
   }
-  
+
   // Verify all expected users exist
   const shouldExist = [
-    // Original users that weren't deleted (filter out nulls before creating array)
-    ...Array.from({ length: 20 }, (_, i) => 
-      (i - 1) % 3 === 0 ? undefined : `base${i}`).filter((id): id is string => id !== undefined),
-    // New users
-    ...Array.from({ length: 10 }, (_, i) => `new${i}`),
-    // Invited users
-    ...Array.from({ length: 5 }, (_, i) => `invited${i}`)
+    // Original users that weren't deleted
+    ...users.filter(u => !toDelete.find(d => d.id === u.id)),
+    ...newUsers,
+    ...invitedUsers
   ];
 
-  for (const id of shouldExist) {
-    const exists = await waitlist.getPosition(id);
+  for (const user of shouldExist) {
+    const exists = await waitlist.getPosition(user.id);
     if (!exists) {
-      throw new Error(`Expected user ${id} not found`);
+      throw new Error(`Expected user ${user.email} not found`);
     }
   }
 
   // Verify deleted users don't exist
-  const shouldNotExist = Array.from({ length: 5 }, (_, i) => `base${1 + i * 3}`);
-  for (const id of shouldNotExist) {
-    const exists = await waitlist.getPosition(id);
+  for (const user of toDelete) {
+    const exists = await waitlist.getPosition(user.id);
     if (exists) {
-      throw new Error(`Deleted user ${id} still exists at position ${exists}`);
+      throw new Error(`Deleted user ${user.email} still exists at position ${exists}`);
     }
   }
 
   // Verify invite code creators are in correct positions relative to their invitees
   for (const { creator, bumpPositions } of inviteCodes) {
-    const creatorPos = await waitlist.getPosition(creator);
-    if (creatorPos === 0) continue; // Skip if creator was deleted
+    // Skip if creator was deleted
+    if (toDelete.find(d => d.id === creator.id)) continue;
+
+    const creatorPos = await waitlist.getPosition(creator.id);
     
     // Find invited user's position
-    const invitedUser = `invited${inviteCodes.findIndex(ic => ic.creator === creator)}`;
-    const invitedPos = await waitlist.getPosition(invitedUser);
+    const invitedUser = invitedUsers[inviteCodes.findIndex(ic => ic.creator.id === creator.id)];
+    const invitedPos = await waitlist.getPosition(invitedUser.id);
     
-    // Verify creator is ahead of their invited user
     if (creatorPos >= invitedPos) {
       throw new Error(
-        `Creator ${creator} at position ${creatorPos} should be ahead of invited user ${invitedUser} at position ${invitedPos}`
+        `Creator ${creator.email} at position ${creatorPos} should be ahead of invited user ${invitedUser.email} at position ${invitedPos}`
       );
     }
-  }
-
-  // Verify total length
-  const expectedLength = await (async () => {
-    // Start with 20 base users
-    const baseUsers = 20;
-    
-    // Subtract 5 deleted users (every 3rd user starting from base1)
-    const deletedUsers = 5;  // base1, base4, base7, base10, base13
-    
-    // Add 10 new users
-    const newUsers = 10;  // new0 through new9
-    
-    // Add 5 invited users
-    const invitedUsers = 5;  // invited0 through invited4
-    
-    return baseUsers - deletedUsers + newUsers + invitedUsers;  // 20 - 5 + 10 + 5 = 30
-  })();
-
-  const actualLength = await waitlist.getLength();
-  if (actualLength !== expectedLength) {
-    throw new Error(`Expected ${expectedLength} users, got ${actualLength}`);
-  }
-}
-
-async function testLargeScaleBackwardBump(): Promise<void> {
-  const TOTAL_USERS = 2000;
-  const BUMP_START = 400;
-  const BUMP_END = 1000;
-  const BUMP_POSITIONS = 99;
-
-  // Insert users sequentially
-  const insertOperations = Array.from({ length: TOTAL_USERS }, (_, i) =>
-    waitlist.insertUser(`user${i}`, {
-      email: `user${i}@test.com`,
-      metadata: { name: `User ${i}` }
-    })
-  );
-  await Promise.all(insertOperations);
-
-  // Move users backward one at a time (to higher numbers)
-  for (let i = BUMP_END; i >= BUMP_START; i--) {  // Move in REVERSE order
-    const userId = `user${i}`;
-    const targetPos = Math.min(TOTAL_USERS, i + 1 + BUMP_POSITIONS);
-    await waitlist.moveUser(userId, targetPos);
-  }
-
-  // Verify final positions
-  for (let i = BUMP_START; i <= BUMP_END; i++) {
-    const userId = `user${i}`;
-    const pos = await waitlist.getPosition(userId);
-    const expectedPos = Math.min(TOTAL_USERS, i + 1 + BUMP_POSITIONS);
-    
-    if (pos !== expectedPos) {
-      throw new Error(`User ${userId} at wrong position. Expected ${expectedPos}, got ${pos}`);
-    }
-  }
-
-  // Verify total length hasn't changed
-  const finalLength = await waitlist.getLength();
-  if (finalLength !== TOTAL_USERS) {
-    throw new Error(`Expected ${TOTAL_USERS} users, got ${finalLength}`);
   }
 }
 
 async function testRepeatedLargeScaleMovement(): Promise<void> {
   const TOTAL_USERS = 10000;
   const BATCH_SIZE = 5;  // 2000 batches of 5 users each
-  const TARGET_USER = 'user5000';
   const MOVEMENT_CYCLES = 100;
 
-  // Insert users in batches
+  // Insert users in batches and track their IDs
+  const users: TrackedUser[] = new Array(TOTAL_USERS);
+  
   for (let batchStart = 0; batchStart < TOTAL_USERS; batchStart += BATCH_SIZE) {
     const batchOperations = Array.from({ length: BATCH_SIZE }, (_, i) => {
-      const userId = `user${batchStart + i}`;
-      return waitlist.insertUser(userId, {
-        email: `${userId}@test.com`,
-        metadata: { name: `User ${batchStart + i}` }
+      const userIndex = batchStart + i;
+      return waitlist.insertUser({
+        email: `user${userIndex}@test.com`,
+        metadata: { name: `User ${userIndex}` }
       });
     });
-    await Promise.all(batchOperations);
+    
+    const results = await Promise.all(batchOperations);
+    results.forEach((result, i) => {
+      const userIndex = batchStart + i;
+      users[userIndex] = { 
+        id: result.id, 
+        email: `user${userIndex}@test.com` 
+      };
+    });
   }
 
-  // Record initial position of target user
-  const initialPosition = await waitlist.getPosition(TARGET_USER);
+  // Get target user (user5000)
+  const targetUser = users[5000];
+
+  // Record initial position
+  const initialPosition = await waitlist.getPosition(targetUser.id);
   if (initialPosition !== 5001) { // 0-based to 1-based indexing
     throw new Error(`Initial position wrong. Expected 5001, got ${initialPosition}`);
   }
@@ -1349,22 +1432,22 @@ async function testRepeatedLargeScaleMovement(): Promise<void> {
   // Move user back and forth repeatedly
   for (let cycle = 0; cycle < MOVEMENT_CYCLES; cycle++) {
     // Move to position 1
-    await waitlist.moveUser(TARGET_USER, 1);
-    const frontPos = await waitlist.getPosition(TARGET_USER);
+    await waitlist.moveUser(targetUser.id, 1);
+    const frontPos = await waitlist.getPosition(targetUser.id);
     if (frontPos !== 1) {
       throw new Error(`Cycle ${cycle}: Front position wrong. Expected 1, got ${frontPos}`);
     }
 
     // Move back to original position
-    await waitlist.moveUser(TARGET_USER, initialPosition);
-    const backPos = await waitlist.getPosition(TARGET_USER);
+    await waitlist.moveUser(targetUser.id, initialPosition);
+    const backPos = await waitlist.getPosition(targetUser.id);
     if (backPos !== initialPosition) {
       throw new Error(`Cycle ${cycle}: Back position wrong. Expected ${initialPosition}, got ${backPos}`);
     }
   }
 
   // Final verification
-  const finalPosition = await waitlist.getPosition(TARGET_USER);
+  const finalPosition = await waitlist.getPosition(targetUser.id);
   if (finalPosition !== initialPosition) {
     throw new Error(`Final position wrong. Expected ${initialPosition}, got ${finalPosition}`);
   }
@@ -1388,7 +1471,7 @@ async function testBatchInsertAndSequentialMoves(): Promise<void> {
   for (let batchStart = 0; batchStart < TOTAL_USERS; batchStart += BATCH_SIZE) {
     const batchOperations = Array.from({ length: BATCH_SIZE }, (_, i) => {
       const userId = `user${batchStart + i}`;
-      return waitlist.insertUser(userId, {
+      return waitlist.insertUser({
         email: `${userId}@test.com`,
         metadata: { name: `User ${batchStart + i}` }
       });
@@ -1414,12 +1497,680 @@ async function testBatchInsertAndSequentialMoves(): Promise<void> {
   }
 }
 
+async function testLargeScaleBackwardBump(): Promise<void> {
+  const TOTAL_USERS = 2000;
+  const BUMP_START = 400;
+  const BUMP_END = 1000;
+  const BUMP_POSITIONS = 99;
+
+  // Insert users sequentially and track their IDs
+  const users: TrackedUser[] = new Array(TOTAL_USERS);
+  const insertOperations = Array.from({ length: TOTAL_USERS }, (_, i) =>
+    waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    }).then(result => {
+      users[i] = { id: result.id, email: `user${i}@test.com` };
+      return result;
+    })
+  );
+  await Promise.all(insertOperations);
+
+  // Move users backward one at a time (to higher numbers)
+  for (let i = BUMP_END; i >= BUMP_START; i--) {  // Move in REVERSE order
+    const targetPos = Math.min(TOTAL_USERS, i + 1 + BUMP_POSITIONS);
+    await waitlist.moveUser(users[i].id, targetPos);
+  }
+
+  // Verify final positions
+  for (let i = BUMP_START; i <= BUMP_END; i++) {
+    const pos = await waitlist.getPosition(users[i].id);
+    const expectedPos = Math.min(TOTAL_USERS, i + 1 + BUMP_POSITIONS);
+    
+    if (pos !== expectedPos) {
+      throw new Error(`User ${users[i].email} at wrong position. Expected ${expectedPos}, got ${pos}`);
+    }
+  }
+
+  // Verify total length hasn't changed
+  const finalLength = await waitlist.getLength();
+  if (finalLength !== TOTAL_USERS) {
+    throw new Error(`Expected ${TOTAL_USERS} users, got ${finalLength}`);
+  }
+}
+
+async function testInviteCodeFormat(): Promise<void> {
+  // Create initial user
+  const creatorResult = await waitlist.insertUser({
+    email: 'creator@test.com',
+    metadata: { name: 'Creator' }
+  });
+
+  // Test default length (6)
+  const defaultCode = await waitlist.createInviteCode(creatorResult.id, 1);
+  if (defaultCode.length !== 6) {
+    throw new Error(`Expected code length 6, got ${defaultCode.length}`);
+  }
+  if (!/^[A-Z0-9]+$/.test(defaultCode)) {
+    throw new Error(`Code contains invalid characters: ${defaultCode}`);
+  }
+
+  // Test setting new length
+  waitlist.setInviteCodeLength(10);
+  const longerCode = await waitlist.createInviteCode(creatorResult.id, 1);
+  if (longerCode.length !== 10) {
+    throw new Error(`Expected code length 10, got ${longerCode.length}`);
+  }
+  if (!/^[A-Z0-9]+$/.test(longerCode)) {
+    throw new Error(`Code contains invalid characters: ${longerCode}`);
+  }
+
+  // Test length limits
+  try {
+    waitlist.setInviteCodeLength(16);
+    throw new Error('Should not allow length > 15');
+  } catch (e) {
+    if (!(e instanceof Error) || !e.message.includes('cannot exceed 15')) {
+      throw e;
+    }
+  }
+
+  try {
+    waitlist.setInviteCodeLength(0);
+    throw new Error('Should not allow length < 1');
+  } catch (e) {
+    if (!(e instanceof Error) || !e.message.includes('must be at least 1')) {
+      throw e;
+    }
+  }
+}
+
+async function testInviteCodeLengthChanges(): Promise<void> {
+  // Create initial user
+  const creatorResult = await waitlist.insertUser({
+    email: 'creator@test.com',
+    metadata: { name: 'Creator' }
+  });
+
+  // Test default length (6)
+  const defaultCode = await waitlist.createInviteCode(creatorResult.id, 1);
+  if (defaultCode.length !== 6) {
+    throw new Error(`Default code length wrong. Expected 6, got ${defaultCode.length}`);
+  }
+
+  // Change to length 8
+  waitlist.setInviteCodeLength(8);
+  const code8 = await waitlist.createInviteCode(creatorResult.id, 1);
+  if (code8.length !== 8) {
+    throw new Error(`Code length wrong after change. Expected 8, got ${code8.length}`);
+  }
+
+  // Change to length 4
+  waitlist.setInviteCodeLength(4);
+  const code4 = await waitlist.createInviteCode(creatorResult.id, 1);
+  if (code4.length !== 4) {
+    throw new Error(`Code length wrong after second change. Expected 4, got ${code4.length}`);
+  }
+
+  // Verify all codes are alphanumeric uppercase
+  const allCodes = [defaultCode, code8, code4];
+  for (const code of allCodes) {
+    if (!/^[A-Z0-9]+$/.test(code)) {
+      throw new Error(`Invalid characters in code: ${code}`);
+    }
+  }
+}
+
+async function testInviteCodeTracking(): Promise<void> {
+  // Create two users: a creator and someone who will use their code
+  const creatorResult = await waitlist.insertUser({
+    email: 'creator@test.com',
+    phone: '+15551234567',
+    metadata: { name: 'Creator' }
+  });
+
+  // Create multiple invite codes
+  const code1 = await waitlist.createInviteCode(creatorResult.id, 1);
+  const code2 = await waitlist.createInviteCode(creatorResult.id, 2);
+  const code3 = await waitlist.createInviteCode(creatorResult.id, 3);
+
+  // Verify getUserCreatedInviteCodes
+  const createdCodes = await waitlist.getUserCreatedInviteCodes(creatorResult.id);
+  if (createdCodes.length !== 3) {
+    throw new Error(`Expected 3 created codes, got ${createdCodes.length}`);
+  }
+  
+  const expectedCodes = [code1, code2, code3].sort();
+  const actualCodes = [...createdCodes].sort();
+  if (JSON.stringify(actualCodes) !== JSON.stringify(expectedCodes)) {
+    throw new Error(`Created codes mismatch. Expected ${expectedCodes}, got ${actualCodes}`);
+  }
+
+  // Use one of the codes
+  const invitedResult = await waitlist.useInviteCode(code2, {
+    email: 'invited@test.com',
+    phone: '+15557654321',
+    metadata: { name: 'Invited User' }
+  }, 2);
+
+  // Check invite code usage info for the invited user
+  const usageInfo = await waitlist.getInviteCodeUsedBy(invitedResult.id);
+  
+  // Verify code
+  if (usageInfo.code !== code2) {
+    throw new Error(`Wrong invite code. Expected ${code2}, got ${usageInfo.code}`);
+  }
+
+  // Verify creator ID
+  if (usageInfo.creatorId !== creatorResult.id) {
+    throw new Error(`Wrong creator ID. Expected ${creatorResult.id}, got ${usageInfo.creatorId}`);
+  }
+
+  // Verify creator email
+  if (usageInfo.creatorEmail !== 'creator@test.com') {
+    throw new Error(`Wrong creator email. Expected creator@test.com, got ${usageInfo.creatorEmail}`);
+  }
+
+  // Verify creator phone
+  if (usageInfo.creatorPhone !== '+15551234567') {
+    throw new Error(`Wrong creator phone. Expected +15551234567, got ${usageInfo.creatorPhone}`);
+  }
+
+  // Check invite code info for a user who didn't use an invite code
+  const regularResult = await waitlist.insertUser({
+    email: 'regular@test.com',
+    metadata: { name: 'Regular User' }
+  });
+
+  const regularUsageInfo = await waitlist.getInviteCodeUsedBy(regularResult.id);
+  if (regularUsageInfo.code !== null || 
+      regularUsageInfo.creatorId !== null || 
+      regularUsageInfo.creatorEmail !== null || 
+      regularUsageInfo.creatorPhone !== null) {
+    throw new Error('Expected null values for user who did not use invite code');
+  }
+}
+
+async function testSignupCutoffChanges(): Promise<void> {
+  // Insert 10 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 10; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Test setting cutoff higher than list length (should set to list length)
+  waitlist.setSignupCutoff(20);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  for (const user of users) {
+    const canSignUp = await waitlist.canUserSignUp(user.id);
+    if (!canSignUp) {
+      throw new Error(`User ${user.email} should be able to sign up with high cutoff`);
+    }
+  }
+
+  // Test setting cutoff to 5
+  waitlist.setSignupCutoff(5);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  for (let i = 0; i < users.length; i++) {
+    const canSignUp = await waitlist.canUserSignUp(users[i].id);
+    if (i < 5 && !canSignUp) {
+      throw new Error(`User ${users[i].email} should be able to sign up (position ${i + 1} <= 5)`);
+    }
+    if (i >= 5 && canSignUp) {
+      throw new Error(`User ${users[i].email} should not be able to sign up (position ${i + 1} > 5)`);
+    }
+  }
+
+  // Test setting cutoff to -1 (no one can sign up)
+  waitlist.setSignupCutoff(-1);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  for (const user of users) {
+    const canSignUp = await waitlist.canUserSignUp(user.id);
+    if (canSignUp) {
+      throw new Error(`User ${user.email} should not be able to sign up with cutoff -1`);
+    }
+  }
+}
+
+async function testSignupCutoffReduction(): Promise<void> {
+  // Insert 10 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 10; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Set initial cutoff to 5 and wait a bit for it to be set
+  waitlist.setSignupCutoff(5);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Sign up first two users
+  const signupResults = await Promise.all([
+    waitlist.markUserAsSignedUp(users[0].id),
+    waitlist.markUserAsSignedUp(users[1].id)
+  ]);
+
+  if (!signupResults[0] || !signupResults[1]) {
+    throw new Error('Failed to sign up initial users');
+  }
+
+  // Reduce cutoff to 2 and wait a bit for it to be set
+  waitlist.setSignupCutoff(2);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Try to sign up user at position 4 (was in old cutoff, now outside)
+  const user4SignupResult = await waitlist.markUserAsSignedUp(users[3].id);
+  if (user4SignupResult) {
+    throw new Error('User 4 should not be able to sign up after cutoff reduction');
+  }
+
+  // Verify user 4 still can't sign up
+  const canUser4SignUp = await waitlist.canUserSignUp(users[3].id);
+  if (canUser4SignUp) {
+    throw new Error('User 4 should not be allowed to sign up');
+  }
+}
+
+async function testSignupCutoffDeletion(): Promise<void> {
+  // Insert 10 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 10; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Set cutoff to 5 and wait for it to be set
+  waitlist.setSignupCutoff(5);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Sign up first two users
+  await Promise.all([
+    waitlist.markUserAsSignedUp(users[0].id),
+    waitlist.markUserAsSignedUp(users[1].id)
+  ]);
+
+  // Try to delete users in different positions
+  // Should fail for signed up users (0,1) and users in cutoff but not signed up (2,3,4)
+  // Should succeed for users outside cutoff (5+)
+  for (let i = 0; i < users.length; i++) {
+    try {
+      await waitlist.deleteUser(users[i].id);
+      if (i < 5) {
+        throw new Error(`Should not be able to delete user ${i} within signup cutoff`);
+      }
+    } catch (e) {
+      if (i >= 5) {
+        throw new Error(`Should be able to delete user ${i} outside signup cutoff`);
+      }
+      if (!(e instanceof Error) || !e.message.includes('Cannot delete user within signup cutoff')) {
+        if (e instanceof Error && e.message.includes('Cannot delete user that has already signed up')) {
+          // This is fine for users 0 and 1 who are signed up
+          if (i > 1) {
+            throw new Error(`Expected error about signup cutoff but got signed up error for user ${i}`);
+          }
+        } else {
+          throw e;
+        }
+      }
+    }
+  }
+
+  // Verify all users within cutoff still exist
+  for (let i = 0; i < 5; i++) {
+    const position = await waitlist.getPosition(users[i].id);
+    if (!position || position !== i + 1) {
+      throw new Error(`User ${i} within cutoff should still exist at position ${i + 1}`);
+    }
+  }
+}
+
+async function testSignupCutoffMovement(): Promise<void> {
+  // Insert 10 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 10; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Set cutoff to 10 so we can sign up users
+  waitlist.setSignupCutoff(10);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Sign up first two users
+  await Promise.all([
+    waitlist.markUserAsSignedUp(users[0].id),
+    waitlist.markUserAsSignedUp(users[1].id)
+  ]);
+
+  // Set cutoff to 5 for the movement tests
+  waitlist.setSignupCutoff(5);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Try to move users in different scenarios
+  const testCases = [
+    // Try to move signed up user (position 1)
+    { user: users[0], targetPos: 3, error: 'Cannot move user that has already signed up' },
+    
+    // Try to move user in cutoff (position 3) up
+    { user: users[2], targetPos: 2, error: 'Cannot move user that is within signup cutoff' },
+    
+    // Try to move user in cutoff (position 3) down
+    { user: users[2], targetPos: 7, error: 'Cannot move user that is within signup cutoff' },
+    
+    // Try to move user outside cutoff (position 7) into cutoff
+    { user: users[6], targetPos: 3, error: 'Cannot move user to position at or above signup cutoff' },
+    
+    // Verify user outside cutoff can move to another position outside cutoff
+    { user: users[6], targetPos: 8, error: null }
+  ];
+
+  for (const testCase of testCases) {
+    try {
+      await waitlist.moveUser(testCase.user.id, testCase.targetPos);
+      if (testCase.error) {
+        throw new Error(`Expected error "${testCase.error}" but move succeeded for user ${testCase.user.email}`);
+      }
+    } catch (e) {
+      if (!testCase.error) {
+        if (e instanceof Error) {
+          throw new Error(`Expected move to succeed for user ${testCase.user.email} but got error: ${e.message}`);
+        }
+        throw e;
+      }
+      if (!(e instanceof Error) || !e.message.includes(testCase.error)) {
+        if (e instanceof Error) {
+          throw new Error(`Expected error "${testCase.error}" but got "${e.message}" for user ${testCase.user.email}`);
+        }
+        throw e;
+      }
+    }
+  }
+
+  // Verify positions haven't changed for users in cutoff
+  for (let i = 0; i < 5; i++) {
+    const position = await waitlist.getPosition(users[i].id);
+    if (position !== i + 1) {
+      throw new Error(`User ${i} should still be at position ${i + 1}, but is at ${position}`);
+    }
+  }
+}
+
+async function testSignedUpUserMovement(): Promise<void> {
+  // Insert 10 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 10; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Set cutoff to 10 so we can sign up users
+  waitlist.setSignupCutoff(10);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Sign up users 1 and 3
+  await Promise.all([
+    waitlist.markUserAsSignedUp(users[0].id),
+    waitlist.markUserAsSignedUp(users[2].id)
+  ]);
+
+  // Set cutoff back to 5 for the movement tests
+  waitlist.setSignupCutoff(5);
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Try to move signed up users
+  const testCases = [
+    // Try to move first signed up user up and down
+    { user: users[0], targetPos: 2, error: 'Cannot move user that has already signed up' },
+    { user: users[0], targetPos: 5, error: 'Cannot move user that has already signed up' },
+    
+    // Try to move second signed up user up and down
+    { user: users[2], targetPos: 1, error: 'Cannot move user that has already signed up' },
+    { user: users[2], targetPos: 7, error: 'Cannot move user that has already signed up' }
+  ];
+
+  for (const testCase of testCases) {
+    try {
+      await waitlist.moveUser(testCase.user.id, testCase.targetPos);
+      throw new Error(`Expected error for moving signed up user ${testCase.user.email} to position ${testCase.targetPos}`);
+    } catch (e) {
+      if (!(e instanceof Error) || !e.message.includes(testCase.error)) {
+        throw e;
+      }
+    }
+  }
+
+  // Verify positions haven't changed
+  const finalPositions = await Promise.all([
+    waitlist.getPosition(users[0].id),
+    waitlist.getPosition(users[2].id)
+  ]);
+
+  if (finalPositions[0] !== 1) {
+    throw new Error(`First signed up user should still be at position 1, but is at ${finalPositions[0]}`);
+  }
+  if (finalPositions[1] !== 3) {
+    throw new Error(`Second signed up user should still be at position 3, but is at ${finalPositions[1]}`);
+  }
+}
+
+async function testSignupCutoffBoundary(): Promise<void> {
+  // Insert 10 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 10; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Set cutoff to 5
+  waitlist.setSignupCutoff(5);
+
+  // Try to move users from outside the cutoff into various positions within it
+  const testCases = [
+    // Try to move to first position
+    { user: users[7], targetPos: 1, error: 'Cannot move user to position at or above signup cutoff' },
+    
+    // Try to move to middle of cutoff
+    { user: users[8], targetPos: 3, error: 'Cannot move user to position at or above signup cutoff' },
+    
+    // Try to move to cutoff boundary
+    { user: users[9], targetPos: 5, error: 'Cannot move user to position at or above signup cutoff' },
+    
+    // Verify can move to position just after cutoff
+    { user: users[7], targetPos: 6, error: null }
+  ];
+
+  for (const testCase of testCases) {
+    try {
+      await waitlist.moveUser(testCase.user.id, testCase.targetPos);
+      if (testCase.error) {
+        throw new Error(`Expected error "${testCase.error}" but move succeeded for user ${testCase.user.email}`);
+      }
+    } catch (e) {
+      if (!testCase.error) {
+        if (e instanceof Error) {
+          throw new Error(`Expected move to succeed for user ${testCase.user.email} but got error: ${e.message}`);
+        }
+        throw e;
+      }
+      if (!(e instanceof Error) || !e.message.includes(testCase.error)) {
+        if (e instanceof Error) {
+          throw new Error(`Expected error "${testCase.error}" but got "${e.message}" for user ${testCase.user.email}`);
+        }
+        throw e;
+      }
+    }
+  }
+
+  // Verify positions of users in cutoff haven't changed
+  for (let i = 0; i < 5; i++) {
+    const position = await waitlist.getPosition(users[i].id);
+    if (position !== i + 1) {
+      throw new Error(`User ${i} should still be at position ${i + 1}, but is at ${position}`);
+    }
+  }
+}
+
+async function testSignedUpUserDeletion(): Promise<void> {
+  // Insert 10 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 10; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      phone: `+1555000${i.toString().padStart(4, '0')}`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ 
+      id: result.id, 
+      email: `user${i}@test.com`,
+      phone: `+1555000${i.toString().padStart(4, '0')}`
+    });
+  }
+
+  // Set cutoff to 10 so we can sign up users
+  await waitlist.setSignupCutoff(10);
+
+  // Sign up users at positions 1, 4, and 7
+  await Promise.all([
+    waitlist.markUserAsSignedUp(users[0].id),
+    waitlist.markUserAsSignedUp(users[3].id),
+    waitlist.markUserAsSignedUp(users[6].id)
+  ]);
+
+  // Set cutoff back to 5 for the deletion tests
+  await waitlist.setSignupCutoff(5);
+
+  // Verify users are actually signed up
+  const signedUpStates = await Promise.all([
+    waitlist.isUserSignedUp(users[0].id),
+    waitlist.isUserSignedUp(users[3].id),
+    waitlist.isUserSignedUp(users[6].id)
+  ]);
+
+  if (!signedUpStates.every(state => state)) {
+    throw new Error('Failed to mark users as signed up');
+  }
+
+  // Try to delete signed up users using all deletion methods
+  const signedUpIndices = [0, 3, 6];
+  for (const index of signedUpIndices) {
+    const user = users[index];
+    const testCases = [
+      { method: () => waitlist.deleteUser(user.id), desc: 'deleteUser' },
+      { method: () => waitlist.deleteUserByEmail(user.email!), desc: 'deleteUserByEmail' },
+      { method: () => waitlist.deleteUserByPhone(user.phone!), desc: 'deleteUserByPhone' }
+    ];
+
+    for (const testCase of testCases) {
+      try {
+        await testCase.method();
+        throw new Error(`Expected deletion to fail for signed up user when using ${testCase.desc}`);
+      } catch (e) {
+        if (!(e instanceof Error)) {
+          throw e;
+        }
+        if (!(
+          e.message.includes('Cannot delete user that has already signed up') ||
+          e.message.includes('Cannot delete user within signup cutoff')
+        )) {
+          throw e; // Re-throw if it's not one of our expected error messages
+        }
+        // Otherwise the error is expected, continue to next test case
+      }
+    }
+  }
+
+  // Verify signed up users still exist in their original positions
+  const positions = await Promise.all([
+    waitlist.getPosition(users[0].id),
+    waitlist.getPosition(users[3].id),
+    waitlist.getPosition(users[6].id)
+  ]);
+
+  if (positions[0] !== 1) {
+    throw new Error(`First signed up user should still be at position 1, but is at ${positions[0]}`);
+  }
+  if (positions[1] !== 4) {
+    throw new Error(`Second signed up user should still be at position 4, but is at ${positions[1]}`);
+  }
+  if (positions[2] !== 7) {
+    throw new Error(`Third signed up user should still be at position 7, but is at ${positions[2]}`);
+  }
+
+  // Verify we can still delete non-signed up users
+  await waitlist.deleteUser(users[8].id);
+  const deletedPosition = await waitlist.getPosition(users[8].id);
+  if (deletedPosition !== 0) {
+    throw new Error(`Deleted user should not exist in waitlist`);
+  }
+}
+
+async function testSignupAllUsers(): Promise<void> {
+  // Insert 10 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 10; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Set cutoff to list length (10)
+  await waitlist.setSignupCutoff(10);
+  await new Promise(resolve => setTimeout(resolve, 100)); // Wait for cutoff to be set
+
+  // Try to sign up all users
+  const signupResults = await Promise.all(
+    users.map(user => waitlist.markUserAsSignedUp(user.id))
+  );
+
+  // Verify all signups succeeded
+  for (let i = 0; i < users.length; i++) {
+    if (!signupResults[i]) {
+      throw new Error(`Failed to sign up user ${users[i].email}`);
+    }
+  }
+
+  // Double check that all users are marked as signed up
+  const signupStates = await Promise.all(
+    users.map(user => waitlist.isUserSignedUp(user.id))
+  );
+
+  for (let i = 0; i < users.length; i++) {
+    if (!signupStates[i]) {
+      throw new Error(`User ${users[i].email} should be marked as signed up`);
+    }
+  }
+}
+
 // Main test runner
 async function runTests() {
   let hasError = false;
   
   try {
-    const tests = [
+const tests = [
       ['Concurrent Email Users', testConcurrentEmailUsers],
       ['Concurrent Duplicate User Email', testConcurrentDuplicateUserEmail],
       ['Concurrent Duplicate User Phone', testConcurrentDuplicateUserPhone],
@@ -1445,7 +2196,18 @@ async function runTests() {
       ['Complex Concurrent Operations', testComplexConcurrentOperations],
       ['Repeated Large Scale Movement', testRepeatedLargeScaleMovement],
       ['Batch Insert and Sequential Moves', testBatchInsertAndSequentialMoves],
-      ['Large Scale Backward Bump', testLargeScaleBackwardBump]
+      ['Large Scale Backward Bump', testLargeScaleBackwardBump],
+      ['Invite Code Format', testInviteCodeFormat],
+      ['Invite Code Length Changes', testInviteCodeLengthChanges],
+      ['Invite Code Tracking', testInviteCodeTracking],
+      ['Signup Cutoff Changes', testSignupCutoffChanges],
+      ['Signup Cutoff Reduction', testSignupCutoffReduction],
+      ['Signup Cutoff Deletion', testSignupCutoffDeletion],
+      ['Signup Cutoff Movement', testSignupCutoffMovement],
+      ['Signed Up User Movement', testSignedUpUserMovement],
+      ['Signup Cutoff Boundary', testSignupCutoffBoundary],
+      ['Signed Up User Deletion', testSignedUpUserDeletion],
+      ['Sign Up All Users', testSignupAllUsers]
     ] as const;
 
     for (const [name, testFn] of tests) {

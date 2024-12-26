@@ -5,9 +5,16 @@ export interface RedisConfig {
 }
 
 export interface InsertResult {
+    id: string;
     position: number;
     already_existed: boolean;
-}
+  }
+  
+ export interface TrackedUser {
+    id: string;
+    email?: string;
+    phone?: string;
+  }
 
 export interface UserData {
     email?: string;
