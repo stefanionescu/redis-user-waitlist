@@ -7,9 +7,10 @@ A TypeScript implementation of a scalable waitlist system using Redis, supportin
 - Concurrent user management with email/phone identification
 - Linked list-based waitlist system for efficient position management
 - Invite code system with configurable position bumping
+- Signup cutoff management for controlled user signups
 - Atomic operations using Redis Lua scripts
 - Email and phone number uniqueness enforcement
-- Comprehensive test suite with 25+ test scenarios
+- Comprehensive test suite with 35+ test scenarios
 
 ## Prerequisites
 
@@ -50,23 +51,23 @@ const waitlist = new WaitlistManager({
 });
 
 // Insert a user
-const result = await waitlist.insertUser('user123', {
+const result = await waitlist.insertUser({
   email: 'user@example.com',
   phone: '+1234567890', // optional
   metadata: { name: 'John Doe' }
 });
 
 // Get user position
-const position = await waitlist.getPosition('user123');
+const position = await waitlist.getPosition(result.id);
 
 // Move user to a different position
-await waitlist.moveUser('user123', 5);
+await waitlist.moveUser(result.id, 5);
 ```
 
 ### API Methods
 
 #### User Management
-- `insertUser(id: string, data: UserData)`: Add a user with email/phone
+- `insertUser(data: UserData)`: Add a user with email/phone
 - `getPosition(id: string)`: Get current position of a user
 - `moveUser(id: string, targetPosition: number)`: Move user to a specific position
 - `moveUserByEmail(email: string, targetPosition: number)`: Move user by email
@@ -79,12 +80,20 @@ await waitlist.moveUser('user123', 5);
 
 #### Invite Code System
 - `createInviteCode(userId: string, minBumpPositions: number)`: Create invite code
-- `useInviteCode(code: string, id: string, userData: UserData, bumpPositions: number)`: Use invite code
+- `useInviteCode(code: string, userData: UserData, bumpPositions: number)`: Use invite code
 - `getInviteCodeCreator(code: string)`: Get code creator
 - `getInviteCodeUser(code: string)`: Get user who used the code
 - `getUserInviteCodeCount(userId: string)`: Get number of codes created by user
 - `getPositionAfterInviteCodeUse(code: string)`: Preview position after using code
 - `getInviteCodeBumpPositions(code: string)`: Get minimum bump positions for code
+- `getUserCreatedInviteCodes(userId: string)`: Get all codes created by a user
+- `getInviteCodeUsedBy(userId: string)`: Get invite code info used by a user
+
+#### Signup Management
+- `setSignupCutoff(cutoff: number)`: Set position cutoff for signups
+- `isUserSignedUp(id: string)`: Check if user has signed up
+- `canUserSignUp(id: string)`: Check if user is eligible to sign up
+- `markUserAsSignedUp(id: string)`: Mark user as signed up
 
 #### Waitlist Information
 - `getOrderedIds()`: Get all user IDs in waitlist order
@@ -111,6 +120,7 @@ All critical operations use Redis Lua scripts to ensure atomicity and consistenc
 - Contact information management
 - Invite code creation and usage
 - Deletion across multiple indices
+- Signup status management
 
 ### Data Structure
 
@@ -120,10 +130,11 @@ Uses multiple Redis data structures for efficient operations:
 - Hash: Email index (`waitlist:emails`)
 - Hash: Phone index (`waitlist:phones`)
 - Hash: Invite code management (`waitlist:invite_codes`, `waitlist:used_codes`)
+- Set: Signup tracking (`waitlist:signed_up`)
 
 ## Testing
 
-The test suite in `waitlistTests.ts` includes 25+ comprehensive test scenarios:
+The test suite in `waitlistTests.ts` includes 35+ comprehensive test scenarios:
 
 ### Concurrent Operations
 - Multiple user insertions
@@ -131,18 +142,22 @@ The test suite in `waitlistTests.ts` includes 25+ comprehensive test scenarios:
 - Position manipulation
 - Invite code usage
 - Contact information updates
+- Signup management
 
 ### Scale Testing
-- Large-scale operations (10,000+ users)
+- Large-scale operations (100,000+ users)
 - Batch insertions and moves
 - Repeated position changes
 - Complex concurrent scenarios
+- Signup cutoff changes
 
 ### Edge Cases
 - Position boundary conditions
 - Deletion during movement
 - Invite code limits
 - Contact information uniqueness
+- Signup eligibility checks
+- Cutoff boundary testing
 
 Run the test suite:
 ```bash
