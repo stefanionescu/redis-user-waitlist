@@ -7,10 +7,11 @@ A TypeScript implementation of a scalable waitlist system using Redis, supportin
 - Concurrent user management with email/phone identification
 - Linked list-based waitlist system for efficient position management
 - Invite code system with configurable position bumping
+- Community code system for direct signup access
 - Signup cutoff management for controlled user signups
 - Atomic operations using Redis Lua scripts
 - Email and phone number uniqueness enforcement
-- Comprehensive test suite with 35+ test scenarios
+- Comprehensive test suite with 45+ test scenarios
 
 ## Prerequisites
 
@@ -89,6 +90,12 @@ await waitlist.moveUser(result.id, 5);
 - `getUserCreatedInviteCodes(userId: string)`: Get all codes created by a user
 - `getInviteCodeUsedBy(userId: string)`: Get invite code info used by a user
 
+#### Community Code System
+- `createCommunityCode(code: string, maxUses: number)`: Create a community code with usage limit
+- `useCommunityCode(code: string, userData: UserData)`: Use code to sign up immediately
+- `getCommunityCodeInfo(code: string)`: Get code usage information
+- `deleteCommunityCode(code: string)`: Delete a community code
+
 #### Signup Management
 - `setSignupCutoff(cutoff: number)`: Set position cutoff for signups
 - `isUserSignedUp(id: string)`: Check if user has signed up
@@ -119,6 +126,7 @@ All critical operations use Redis Lua scripts to ensure atomicity and consistenc
 - Position updates and movement
 - Contact information management
 - Invite code creation and usage
+- Community code usage tracking
 - Deletion across multiple indices
 - Signup status management
 
@@ -130,17 +138,19 @@ Uses multiple Redis data structures for efficient operations:
 - Hash: Email index (`waitlist:emails`)
 - Hash: Phone index (`waitlist:phones`)
 - Hash: Invite code management (`waitlist:invite_codes`, `waitlist:used_codes`)
+- Hash: Community code management (`waitlist:codes`, `waitlist:codes:uses`)
 - Set: Signup tracking (`waitlist:signed_up`)
 
 ## Testing
 
-The test suite in `waitlistTests.ts` includes 35+ comprehensive test scenarios:
+The test suite in `waitlistTests.ts` includes 45+ comprehensive test scenarios:
 
 ### Concurrent Operations
 - Multiple user insertions
 - Duplicate handling
 - Position manipulation
 - Invite code usage
+- Community code usage
 - Contact information updates
 - Signup management
 
@@ -150,11 +160,13 @@ The test suite in `waitlistTests.ts` includes 35+ comprehensive test scenarios:
 - Repeated position changes
 - Complex concurrent scenarios
 - Signup cutoff changes
+- Community code usage limits
 
 ### Edge Cases
 - Position boundary conditions
 - Deletion during movement
 - Invite code limits
+- Community code usage tracking
 - Contact information uniqueness
 - Signup eligibility checks
 - Cutoff boundary testing
