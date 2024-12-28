@@ -48,6 +48,7 @@ export class WaitlistManager {
    * @property userInviteCodes - User's invite code count (Hash: userId -> count)
    * @property inviteCodeBumpPositions - Positions to bump for each code (Hash: code -> positions)
    * @property signedUp - Set of users who have signed up (Set)
+   * @property codes - Hash: code -> JSON {maxUses, currentUses}
    */
   protected keys = {
     waitlist: 'waitlist:list',
@@ -59,6 +60,7 @@ export class WaitlistManager {
     userInviteCodes: 'waitlist:user_codes',
     inviteCodeBumpPositions: 'waitlist:invite_code_bumps',
     signedUp: 'waitlist:signed_up',
+    codes: 'waitlist:codes',
   };
 
   /**
@@ -326,7 +328,7 @@ export class WaitlistManager {
     }));
 
     return {
-      id,
+      id: userId,
       position: position,
       already_existed: exists === 1
     };
@@ -639,11 +641,6 @@ export class WaitlistManager {
           position = i
           break
         end
-      end
-      
-      -- Check if user is within signup cutoff
-      if position > 0 and position <= cutoff then
-        return {err = 'Cannot delete user within signup cutoff'}
       end
       
       -- Parse user data for email/phone
@@ -1436,5 +1433,225 @@ export class WaitlistManager {
     ) as number;
 
     return result === 1;
+  }
+
+  /**
+   * Creates a new code with a specified usage limit
+   * 
+   * @param code - The code to create
+   * @param maxUses - Maximum number of times this code can be used
+   * @returns true if code was created, false if code already exists
+   * 
+   * @example
+   * ```typescript
+   * const created = await waitlistManager.createCommunityCode('LAUNCH2024', 100);
+   * if (created) {
+   *   console.log('Code created successfully');
+   * }
+   * ```
+   */
+  async createCommunityCode(code: string, maxUses: number): Promise<boolean> {
+    if (maxUses < 1) {
+      throw new Error('Maximum uses must be at least 1');
+    }
+
+    const exists = await this.redis.hexists(this.keys.codes, code);
+    if (exists) {
+      return false;
+    }
+
+    await this.redis.hset(this.keys.codes, code, JSON.stringify({
+      maxUses,
+      currentUses: 0
+    }));
+
+    return true;
+  }
+
+  /**
+   * Uses a code to sign up a user immediately
+   * 
+   * @param code - Code to use
+   * @param userData - User data containing email and/or phone
+   * @returns true if successful, error message if unsuccessful
+   * 
+   * @example
+   * ```typescript
+   * const result = await waitlistManager.useCommunityCode('LAUNCH2024', {
+   *   email: 'user@example.com',
+   *   phone: '+1234567890'
+   * });
+   * if (result === true) {
+   *   console.log('Code used successfully');
+   * } else {
+   *   console.log('Failed:', result);
+   * }
+   * ```
+   */
+  async useCommunityCode(code: string, userData: UserData): Promise<true | string> {
+    if (!userData.email && !userData.phone) {
+      return 'Either email or phone must be provided';
+    }
+
+    const script = `
+      local code = ARGV[1]
+      local email = ARGV[2]
+      local phone = ARGV[3]
+      
+      -- Get code data and increment atomically with HINCRBY
+      local codeData = redis.call('HGET', KEYS[1], code)
+      if not codeData then
+        return {err = 'Invalid code'}
+      end
+      
+      local codeInfo = cjson.decode(codeData)
+      -- Use HINCRBY to atomically increment and check
+      local newUses = redis.call('HINCRBY', KEYS[1] .. ':uses', code, 1)
+      
+      if newUses > codeInfo.maxUses then
+        -- Rollback the increment if we went over
+        redis.call('HINCRBY', KEYS[1] .. ':uses', code, -1)
+        return {err = 'Code has reached usage limit'}
+      end
+
+      -- Rest of the checks...
+      local usageKey = 'waitlist:code:' .. code .. ':users'
+      if email ~= '' then
+        if redis.call('SISMEMBER', usageKey, email) == 1 then
+          redis.call('HINCRBY', KEYS[1] .. ':uses', code, -1)
+          return {err = 'Code already used by this email'}
+        end
+      end
+      if phone ~= '' then
+        if redis.call('SISMEMBER', usageKey, phone) == 1 then
+          redis.call('HINCRBY', KEYS[1] .. ':uses', code, -1)
+          return {err = 'Code already used by this phone'}
+        end
+      end
+      
+      -- Update the code info
+      codeInfo.currentUses = newUses
+      redis.call('HSET', KEYS[1], code, cjson.encode(codeInfo))
+      
+      -- Track usage
+      if email ~= '' then
+        redis.call('SADD', usageKey, email)
+      end
+      if phone ~= '' then
+        redis.call('SADD', usageKey, phone)
+      end
+
+      -- If user exists in waitlist, mark them as signed up
+      local existingId = nil
+      if email ~= '' then
+        existingId = redis.call('HGET', KEYS[2], email)
+      end
+      if not existingId and phone ~= '' then
+        existingId = redis.call('HGET', KEYS[3], phone)
+      end
+      
+      if existingId then
+        redis.call('SADD', KEYS[4], existingId)
+      end
+      
+      return {ok = true}
+    `;
+
+    const result = await this.redis.eval(
+      script,
+      4,
+      this.keys.codes,
+      this.keys.emails,
+      this.keys.phones,
+      this.keys.signedUp,
+      code,
+      userData.email || '',
+      userData.phone || ''
+    ) as { err?: string; ok?: boolean };
+
+    if (result.err) {
+      return result.err;
+    }
+
+    return true;
+  }
+
+  /**
+   * Gets information about a code's usage
+   * 
+   * @param code - Code to check
+   * @returns Object containing usage information, or null if code doesn't exist
+   * 
+   * @example
+   * ```typescript
+   * const info = await waitlistManager.getCommunityCodeInfo('LAUNCH2024');
+   * if (info) {
+   *   console.log(`Code used ${info.currentUses}/${info.maxUses} times`);
+   * }
+   * ```
+   */
+  async getCommunityCodeInfo(code: string): Promise<{ 
+    maxUses: number;
+    currentUses: number;
+    remainingUses: number;
+  } | null> {
+    const [data, uses] = await Promise.all([
+      this.redis.hget(this.keys.codes, code),
+      this.redis.hget(this.keys.codes + ':uses', code)
+    ]);
+    
+    if (!data) {
+      return null;
+    }
+
+    const info = JSON.parse(data);
+    const currentUses = uses ? parseInt(uses) : 0;
+    
+    return {
+      maxUses: info.maxUses,
+      currentUses,
+      remainingUses: info.maxUses - currentUses
+    };
+  }
+
+  /**
+   * Deletes a community code and all its associated data
+   * 
+   * @param code - Code to delete
+   * @returns true if code was deleted, false if code didn't exist
+   * 
+   * @example
+   * ```typescript
+   * const deleted = await waitlistManager.deleteCommunityCode('LAUNCH2024');
+   * if (deleted) {
+   *   console.log('Code deleted successfully');
+   * }
+   * ```
+   */
+  async deleteCommunityCode(code: string): Promise<boolean> {
+    const script = `
+      local code = ARGV[1]
+      
+      -- Atomically delete and return if anything was deleted
+      local deleted = redis.call('HDEL', KEYS[1], code)
+      if deleted == 0 then
+        return false
+      end
+      
+      -- Code existed and was deleted, now clean up related data
+      redis.call('HDEL', KEYS[1] .. ':uses', code)
+      redis.call('DEL', 'waitlist:code:' .. code .. ':users')
+      
+      return true
+    `;
+
+    const result = await this.redis.eval(
+      script,
+      1,
+      this.keys.codes,
+      code
+    ) as number;  // Redis returns 1/0 for true/false
+
+    return result === 1;  // Convert to boolean
   }
 }

@@ -26,19 +26,6 @@ async function forceCleanup(): Promise<void> {
   }
 }
 
-async function runTest(name: string, testFn: () => Promise<void>) {
-  try {
-    await testFn();
-    console.log(`${GREEN_CHECK} ${name}`);
-  } catch (err) {
-    console.log(`${RED_X} ${name}`);
-    // Handle the error type properly
-    const error = err as Error;
-    console.error('\x1b[31m', error.message || 'Unknown error', '\x1b[0m');
-    throw error;  // Re-throw to stop test suite
-  }
-}
-
 async function testConcurrentEmailUsers(): Promise<void> {
   // Store the results to get the IDs
   const insertResults: InsertResult[] = [];
@@ -1294,14 +1281,20 @@ async function testComplexConcurrentOperations(): Promise<void> {
     users.push({ id: result.id, email: `base${i}@test.com` });
   }
 
+  interface InviteCodeInfo {
+    code: string;
+    creator: TrackedUser;
+    bumpPositions: number;
+  }
+
   // Create invite codes with different bump positions
-  const inviteCodes = [];
+  const inviteCodes: InviteCodeInfo[] = [];
   for (let i = 0; i < 5; i++) {
     // Use users that won't be deleted (indices 0,2,3,5,6 since we delete 1,4,7...)
     const safeIndices = [0, 2, 3, 5, 6];
     const creator = users[safeIndices[i]];
     const code = await waitlist.createInviteCode(creator.id, i + 1);
-    inviteCodes.push({ code, creator: creator, bumpPositions: i + 1 });
+    inviteCodes.push({ code, creator, bumpPositions: i + 1 });
   }
 
   // Track which users will be deleted (every 3rd user starting from index 1)
@@ -1467,7 +1460,7 @@ async function testBatchInsertAndSequentialMoves(): Promise<void> {
   const TARGET_POSITION = 10;
 
   // Insert users in concurrent batches of 400
-  const batches = [];
+  const batches: Promise<InsertResult[]>[] = [];
   for (let batchStart = 0; batchStart < TOTAL_USERS; batchStart += BATCH_SIZE) {
     const batchOperations = Array.from({ length: BATCH_SIZE }, (_, i) => {
       const userId = `user${batchStart + i}`;
@@ -1787,9 +1780,14 @@ async function testSignupCutoffDeletion(): Promise<void> {
   for (let i = 0; i < 10; i++) {
     const result = await waitlist.insertUser({
       email: `user${i}@test.com`,
+      phone: `+1555${i.toString().padStart(4, '0')}`,
       metadata: { name: `User ${i}` }
     });
-    users.push({ id: result.id, email: `user${i}@test.com` });
+    users.push({ 
+      id: result.id, 
+      email: `user${i}@test.com`,
+      phone: `+1555${i.toString().padStart(4, '0')}`
+    });
   }
 
   // Set cutoff to 5 and wait for it to be set
@@ -1803,36 +1801,39 @@ async function testSignupCutoffDeletion(): Promise<void> {
   ]);
 
   // Try to delete users in different positions
-  // Should fail for signed up users (0,1) and users in cutoff but not signed up (2,3,4)
+  // Should fail for signed up users (0,1)
+  // Should succeed for users in cutoff but not signed up (2,3,4)
   // Should succeed for users outside cutoff (5+)
   for (let i = 0; i < users.length; i++) {
     try {
       await waitlist.deleteUser(users[i].id);
-      if (i < 5) {
-        throw new Error(`Should not be able to delete user ${i} within signup cutoff`);
+      if (i <= 1) {
+        throw new Error(`Should not be able to delete signed up user ${i}`);
       }
+      // Success is expected for all other users (both within and outside cutoff)
     } catch (e) {
-      if (i >= 5) {
-        throw new Error(`Should be able to delete user ${i} outside signup cutoff`);
+      if (i > 1) {
+        throw new Error(`Should be able to delete user ${i}`);
       }
-      if (!(e instanceof Error) || !e.message.includes('Cannot delete user within signup cutoff')) {
-        if (e instanceof Error && e.message.includes('Cannot delete user that has already signed up')) {
-          // This is fine for users 0 and 1 who are signed up
-          if (i > 1) {
-            throw new Error(`Expected error about signup cutoff but got signed up error for user ${i}`);
-          }
-        } else {
-          throw e;
-        }
+      if (!(e instanceof Error) || !e.message.includes('Cannot delete user that has already signed up')) {
+        throw e;
       }
     }
   }
 
-  // Verify all users within cutoff still exist
-  for (let i = 0; i < 5; i++) {
+  // Verify signed up users still exist
+  for (let i = 0; i < 2; i++) {
     const position = await waitlist.getPosition(users[i].id);
     if (!position || position !== i + 1) {
-      throw new Error(`User ${i} within cutoff should still exist at position ${i + 1}`);
+      throw new Error(`Signed up user ${i} should still exist at position ${i + 1}`);
+    }
+  }
+
+  // Verify other users were deleted
+  for (let i = 2; i < users.length; i++) {
+    const position = await waitlist.getPosition(users[i].id);
+    if (position !== 0) {
+      throw new Error(`User ${i} should have been deleted`);
     }
   }
 }
@@ -2165,6 +2166,437 @@ async function testSignupAllUsers(): Promise<void> {
   }
 }
 
+async function testCodeUsageWithWaitlistedUsers(): Promise<void> {
+  // Add 20 users to waitlist
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 20; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Create code with 10 uses
+  await waitlist.createCommunityCode('TEST10', 10);
+
+  // Use code with first 5 users
+  for (let i = 0; i < 5; i++) {
+    const result = await waitlist.useCommunityCode('TEST10', {
+      email: users[i].email
+    });
+    if (result !== true) {
+      throw new Error(`Failed to use code for user ${i}: ${result}`);
+    }
+  }
+
+  // Verify code info
+  const codeInfo = await waitlist.getCommunityCodeInfo('TEST10');
+  if (!codeInfo || codeInfo.remainingUses !== 5) {
+    throw new Error(`Expected 5 remaining uses, got ${codeInfo?.remainingUses}`);
+  }
+
+  // Verify users are marked as signed up
+  for (let i = 0; i < 5; i++) {
+    const isSignedUp = await waitlist.isUserSignedUp(users[i].id);
+    if (!isSignedUp) {
+      throw new Error(`User ${i} should be marked as signed up`);
+    }
+  }
+}
+
+async function testConcurrentCodeUsageWithSameUser(): Promise<void> {
+  // Add 20 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 20; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Create code
+  await waitlist.createCommunityCode('CONCURRENT', 10);
+
+  type CodeResult = 
+  | { success: true; result: true | string }
+  | { success: false; error: string };
+
+  // Try to use code 5 times concurrently with same user
+  const operations = Array(5).fill(null).map(() => 
+    waitlist.useCommunityCode('CONCURRENT', { email: users[0].email })
+      .then(result => ({ success: true, result } as CodeResult))
+      .catch(error => ({ success: false, error: error.toString() } as CodeResult))
+  );
+
+  const results = await Promise.all(operations);
+  
+  // Count successes and failures
+  const successes = results.filter((r): r is { success: true; result: true } => 
+    r.success && r.result === true
+  ).length;
+
+  const failures = results.filter(r => 
+    !r.success || (r.success && r.result !== true)
+  ).length;
+
+  if (successes !== 1 || failures !== 4) {
+    throw new Error(`Expected 1 success and 4 failures, got ${successes} successes and ${failures} failures`);
+  }
+
+  // Verify code was only used once
+  const codeInfo = await waitlist.getCommunityCodeInfo('CONCURRENT');
+  if (!codeInfo || codeInfo.currentUses !== 1) {
+    throw new Error(`Expected 1 code use, got ${codeInfo?.currentUses}`);
+  }
+
+  // Verify user is marked as signed up
+  const isSignedUp = await waitlist.isUserSignedUp(users[0].id);
+  if (!isSignedUp) {
+    throw new Error('User should be marked as signed up');
+  }
+}
+
+async function testCodeUsageLimit(): Promise<void> {
+  // Add 21 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 21; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Create code with 20 uses
+  await waitlist.createCommunityCode('LIMIT20', 20);
+
+  type CodeResult = 
+  | { success: true; result: true | string }
+  | { success: false; error: string };
+
+  // Use code with first 20 users
+  for (let i = 0; i < 20; i++) {
+    const result = await waitlist.useCommunityCode('LIMIT20', { email: users[i].email })
+      .then(result => ({ success: true, result } as CodeResult))
+      .catch(error => ({ success: false, error: error.toString() } as CodeResult));
+    
+    if (!result.success || result.result !== true) {
+      throw new Error(`Expected success for user ${i}, got: ${result.success ? result.result : result.error}`);
+    }
+  }
+
+  // Try to use code with 21st user - should get usage limit message
+  const result = await waitlist.useCommunityCode('LIMIT20', { email: users[20].email })
+    .then(result => ({ success: true, result } as CodeResult))
+    .catch(error => ({ success: false, error: error.toString() } as CodeResult));
+
+  if (result.success && result.result === true) {
+    throw new Error('Expected code usage to fail, but it succeeded');
+  }
+  if (result.success && result.result !== 'Code has reached usage limit') {
+    throw new Error(`Expected 'Code has reached usage limit', got: ${result.result}`);
+  }
+}
+
+async function testCodeUsageWithNonWaitlistedUsers(): Promise<void> {
+  // Create code with 10 uses
+  await waitlist.createCommunityCode('NONWL10', 10);
+
+  type CodeResult = 
+  | { success: true; result: true | string }
+  | { success: false; error: string };
+
+  // Use code 10 times with non-waitlisted users
+  for (let i = 0; i < 10; i++) {
+    const result = await waitlist.useCommunityCode('NONWL10', {
+      email: `nonwl${i}@test.com`
+    })
+      .then(result => ({ success: true, result } as CodeResult))
+      .catch(error => ({ success: false, error: error.toString() } as CodeResult));
+    
+    if (!result.success || result.result !== true) {
+      throw new Error(`Failed to use code for non-waitlisted user ${i}: ${result.success ? result.result : result.error}`);
+    }
+  }
+
+  // Try to use code one more time
+  const result = await waitlist.useCommunityCode('NONWL10', {
+    email: 'extra@test.com'
+  })
+    .then(result => ({ success: true, result } as CodeResult))
+    .catch(error => ({ success: false, error: error.toString() } as CodeResult));
+
+  if (result.success && result.result === true) {
+    throw new Error('Code should not work after reaching usage limit');
+  }
+  if (result.success && result.result !== 'Code has reached usage limit') {
+    throw new Error(`Expected 'Code has reached usage limit', got: ${result.result}`);
+  }
+}
+
+async function testConcurrentCodeUsageWithNonWaitlistedUsers(): Promise<void> {
+  // Create code with 100 uses
+  await waitlist.createCommunityCode('CONCURRENT100', 100);
+
+  // Try to use code 110 times concurrently
+  const operations = Array(110).fill(null).map((_, i) => 
+    waitlist.useCommunityCode('CONCURRENT100', { email: `concurrent${i}@test.com` })
+      .then(result => result === true)  // true for success
+      .catch(() => false)  // false for any error
+  );
+
+  const results = await Promise.all(operations);
+  
+  // Count successes and failures
+  const successes = results.filter(r => r === true).length;
+  const failures = results.filter(r => r === false).length;
+
+  if (successes !== 100 || failures !== 10) {
+    throw new Error(`Expected 100 successes and 10 failures, got ${successes} successes and ${failures} failures`);
+  }
+
+  // Verify code is fully used
+  const codeInfo = await waitlist.getCommunityCodeInfo('CONCURRENT100');
+  if (!codeInfo || codeInfo.currentUses !== 100) {
+    throw new Error(`Expected 100 code uses, got ${codeInfo?.currentUses}`);
+  }
+}
+
+async function testConcurrentCodeUsageWithWaitlistedUsers(): Promise<void> {
+  // Add 110 users
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 110; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Create code with 100 uses
+  await waitlist.createCommunityCode('CONCURRENTWL100', 100);
+
+  // Try to use code 110 times concurrently
+  const operations = users.map(user => 
+    waitlist.useCommunityCode('CONCURRENTWL100', { email: user.email })
+      .then(result => result === true)  // true for success
+      .catch(() => false)  // false for any error
+  );
+
+  const results = await Promise.all(operations);
+  
+  // Count successes and failures
+  const successes = results.filter(r => r === true).length;
+  const failures = results.filter(r => r === false).length;
+
+  if (successes !== 100 || failures !== 10) {
+    throw new Error(`Expected 100 successes and 10 failures, got ${successes} successes and ${failures} failures`);
+  }
+
+  // Verify code is fully used
+  const codeInfo = await waitlist.getCommunityCodeInfo('CONCURRENTWL100');
+  if (!codeInfo || codeInfo.currentUses !== 100) {
+    throw new Error(`Expected 100 code uses, got ${codeInfo?.currentUses}`);
+  }
+
+  // Verify exactly 100 users are marked as signed up
+  const signedUpCount = await Promise.all(users.map(u => waitlist.isUserSignedUp(u.id)))
+    .then(results => results.filter(r => r).length);
+  
+  if (signedUpCount !== 100) {
+    throw new Error(`Expected 100 signed up users, got ${signedUpCount}`);
+  }
+}
+
+async function testVariousCommunityCodeCreation(): Promise<void> {
+  // Array of test codes with different patterns and max uses
+  const testCodes = [
+    { code: '123', maxUses: 5 },                    // Short numeric
+    { code: 'ABCDEF', maxUses: 10 },                // All letters
+    { code: 'TEST100', maxUses: 100 },              // Mixed alphanumeric
+    { code: '12345678', maxUses: 1 },               // Long numeric
+    { code: 'LAUNCH2024', maxUses: 50 },            // Real-world example
+    { code: 'ABC123XYZ', maxUses: 25 },             // Mixed pattern
+    { code: '999999', maxUses: 999 },               // Repeated numbers
+    { code: 'TESTCODE', maxUses: 15 },              // Common pattern
+    { code: '123ABC', maxUses: 30 },                // Numbers then letters
+    { code: 'ABC123', maxUses: 30 },                // Letters then numbers
+    { code: 'A1B2C3', maxUses: 40 },                // Alternating
+    { code: 'TEST', maxUses: 200 },                 // Short word
+    { code: 'BETA555', maxUses: 75 },               // Word with numbers
+    { code: '777WIN', maxUses: 60 },                // Numbers with word
+    { code: 'TESTTEST', maxUses: 45 },              // Repeated word
+    { code: '55TEST55', maxUses: 55 },              // Surrounded by numbers
+    { code: 'CODE1234', maxUses: 80 },              // Word with sequence
+    { code: '2024LAUNCH', maxUses: 150 },           // Year prefix
+    { code: 'DEMO999', maxUses: 90 },               // Word with repeated number
+    { code: 'TEST_2024', maxUses: 120 }             // With underscore
+  ];
+
+  // Create all codes
+  for (const { code, maxUses } of testCodes) {
+    const created = await waitlist.createCommunityCode(code, maxUses);
+    if (!created) {
+      throw new Error(`Failed to create code: ${code}`);
+    }
+  }
+
+  // Verify all codes exist with correct max uses
+  for (const { code, maxUses } of testCodes) {
+    const info = await waitlist.getCommunityCodeInfo(code);
+    if (!info) {
+      throw new Error(`Code not found: ${code}`);
+    }
+    if (info.maxUses !== maxUses) {
+      throw new Error(`Wrong max uses for ${code}: expected ${maxUses}, got ${info.maxUses}`);
+    }
+    if (info.currentUses !== 0) {
+      throw new Error(`Code ${code} should have 0 uses initially, got ${info.currentUses}`);
+    }
+  }
+}
+
+async function testCommunityCodeDeletion(): Promise<void> {
+  // Create 3 codes
+  const codes = [
+    { code: 'CODE1', maxUses: 10 },
+    { code: 'CODE2', maxUses: 20 },
+    { code: 'CODE3', maxUses: 30 }
+  ];
+
+  for (const { code, maxUses } of codes) {
+    await waitlist.createCommunityCode(code, maxUses);
+  }
+
+  // Delete code 2
+  const deleted = await waitlist.deleteCommunityCode('CODE2');
+  if (!deleted) {
+    throw new Error('Failed to delete CODE2');
+  }
+
+  // Verify only codes 1 and 3 remain
+  const code1Info = await waitlist.getCommunityCodeInfo('CODE1');
+  const code2Info = await waitlist.getCommunityCodeInfo('CODE2');
+  const code3Info = await waitlist.getCommunityCodeInfo('CODE3');
+
+  if (!code1Info || !code3Info || code2Info) {
+    throw new Error('Expected only CODE1 and CODE3 to exist');
+  }
+}
+
+async function testCommunityCodeDeletionWithSignedUpUsers(): Promise<void> {
+  // Create 5 users in waitlist
+  const users: TrackedUser[] = [];
+  for (let i = 0; i < 5; i++) {
+    const result = await waitlist.insertUser({
+      email: `user${i}@test.com`,
+      metadata: { name: `User ${i}` }
+    });
+    users.push({ id: result.id, email: `user${i}@test.com` });
+  }
+
+  // Create 2 codes
+  await waitlist.createCommunityCode('CODE_A', 5);
+  await waitlist.createCommunityCode('CODE_B', 5);
+
+  // Have users use the codes
+  await waitlist.useCommunityCode('CODE_A', { email: users[0].email });
+  await waitlist.useCommunityCode('CODE_A', { email: users[1].email });
+  await waitlist.useCommunityCode('CODE_B', { email: users[2].email });
+  await waitlist.useCommunityCode('CODE_B', { email: users[3].email });
+
+  // Delete both codes
+  await waitlist.deleteCommunityCode('CODE_A');
+  await waitlist.deleteCommunityCode('CODE_B');
+
+  // Verify codes are gone
+  const codeAInfo = await waitlist.getCommunityCodeInfo('CODE_A');
+  const codeBInfo = await waitlist.getCommunityCodeInfo('CODE_B');
+  if (codeAInfo || codeBInfo) {
+    throw new Error('Codes should be deleted');
+  }
+
+  // Verify users are still signed up
+  const signedUpStates = await Promise.all([
+    waitlist.isUserSignedUp(users[0].id),
+    waitlist.isUserSignedUp(users[1].id),
+    waitlist.isUserSignedUp(users[2].id),
+    waitlist.isUserSignedUp(users[3].id),
+    waitlist.isUserSignedUp(users[4].id)
+  ]);
+
+  const expectedStates = [true, true, true, true, false];
+  for (let i = 0; i < users.length; i++) {
+    if (signedUpStates[i] !== expectedStates[i]) {
+      throw new Error(`User ${i} signup state is wrong. Expected ${expectedStates[i]}, got ${signedUpStates[i]}`);
+    }
+  }
+}
+
+async function testBulkCommunityCodeDeletion(): Promise<void> {
+  // Create 10 codes
+  const codes = Array.from({ length: 10 }, (_, i) => ({
+    code: `BULK${i + 1}`,
+    maxUses: 10
+  }));
+
+  for (const { code, maxUses } of codes) {
+    await waitlist.createCommunityCode(code, maxUses);
+  }
+
+  // Delete codes 1,3,5,7,9
+  for (let i = 0; i < 10; i += 2) {
+    await waitlist.deleteCommunityCode(`BULK${i + 1}`);
+  }
+
+  // Verify only even-numbered codes remain
+  for (let i = 0; i < 10; i++) {
+    const info = await waitlist.getCommunityCodeInfo(`BULK${i + 1}`);
+    const shouldExist = i % 2 === 1; // Even indices (odd numbers) should exist
+
+    if (shouldExist && !info) {
+      throw new Error(`Code BULK${i + 1} should exist but doesn't`);
+    }
+    if (!shouldExist && info) {
+      throw new Error(`Code BULK${i + 1} shouldn't exist but does`);
+    }
+  }
+}
+
+async function testConcurrentCommunityCodeDeletion(): Promise<void> {
+  // Create a code
+  await waitlist.createCommunityCode('CONCURRENT_DELETE', 100);
+
+  // Try to delete the same code 10 times concurrently
+  const operations = Array(10).fill(null).map(() => 
+    waitlist.deleteCommunityCode('CONCURRENT_DELETE')
+      .then(result => {
+        return result;  // Already boolean
+      })
+      .catch(err => {
+        console.error('Delete error:', err);  // Debug log
+        return false;
+      })
+  );
+
+  const results = await Promise.all(operations);
+  
+  const successes = results.filter(r => r === true).length;
+  const failures = results.filter(r => r === false).length;
+
+  if (successes !== 1 || failures !== 9) {
+    throw new Error(`Expected 1 success and 9 failures, got ${successes} successes and ${failures} failures`);
+  }
+
+  // Verify code is actually deleted
+  const codeInfo = await waitlist.getCommunityCodeInfo('CONCURRENT_DELETE');
+  if (codeInfo !== null) {
+    throw new Error('Code should be deleted but still exists');
+  }
+}
+
 // Main test runner
 async function runTests() {
   let hasError = false;
@@ -2207,7 +2639,18 @@ const tests = [
       ['Signed Up User Movement', testSignedUpUserMovement],
       ['Signup Cutoff Boundary', testSignupCutoffBoundary],
       ['Signed Up User Deletion', testSignedUpUserDeletion],
-      ['Sign Up All Users', testSignupAllUsers]
+      ['Sign Up All Users', testSignupAllUsers],
+      ['Community Code Usage with Waitlisted Users', testCodeUsageWithWaitlistedUsers],
+      ['Concurrent Community Code Usage with Same User', testConcurrentCodeUsageWithSameUser],
+      ['Community Code Usage Limit', testCodeUsageLimit],
+      ['Community Code Usage with Non-Waitlisted Users', testCodeUsageWithNonWaitlistedUsers],
+      ['Concurrent Community Code Usage with Non-Waitlisted Users', testConcurrentCodeUsageWithNonWaitlistedUsers],
+      ['Concurrent Community Code Usage with Waitlisted Users', testConcurrentCodeUsageWithWaitlistedUsers],
+      ['Various Community Code Creation', testVariousCommunityCodeCreation],
+      ['Community Code Deletion', testCommunityCodeDeletion],
+      ['Community Code Deletion with Signed Up Users', testCommunityCodeDeletionWithSignedUpUsers],
+      ['Bulk Community Code Deletion', testBulkCommunityCodeDeletion],
+      ['Concurrent Community Code Deletion', testConcurrentCommunityCodeDeletion]
     ] as const;
 
     for (const [name, testFn] of tests) {
